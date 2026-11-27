@@ -18,14 +18,23 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/plugin"
+	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/testenv"
 )
 
 // piNPM is npm's search as the market asks it, answering with these
 // packages for the keyword alone and those for a search's words.
-func piNPM(t *testing.T, popular, found []string) (asked *atomic.Int32, texts *[]string, down *atomic.Bool) {
+func piNPM(t *testing.T, popular, found []string) (asked *atomic.Int32, texts func() []string, down *atomic.Bool) {
 	t.Helper()
-	asked, texts, down = &atomic.Int32{}, &[]string{}, &atomic.Bool{}
+	asked, down = &atomic.Int32{}, &atomic.Bool{}
+	var mu sync.Mutex
+	var seen []string
+	texts = func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(seen)
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		asked.Add(1)
 		if down.Load() {
@@ -33,7 +42,9 @@ func piNPM(t *testing.T, popular, found []string) (asked *atomic.Int32, texts *[
 			return
 		}
 		text := r.URL.Query().Get("text")
-		*texts = append(*texts, text)
+		mu.Lock()
+		seen = append(seen, text)
+		mu.Unlock()
 		list := popular
 		if text != "keywords:pi-package" {
 			list = found
@@ -44,9 +55,9 @@ func piNPM(t *testing.T, popular, found []string) (asked *atomic.Int32, texts *[
 		fmt.Fprintf(w, `{"total":%d,"objects":[%s]}`, len(list), strings.Join(list, ","))
 	}))
 	t.Cleanup(srv.Close)
-	was, wasReg := piNPMURL, piRegistry
-	piNPMURL, piRegistry = srv.URL, func() string { return "" }
-	t.Cleanup(func() { piNPMURL, piRegistry = was, wasReg })
+	was, wasReg := piNPMBase, piRegistry
+	piNPMBase, piRegistry = srv.URL, func() plugin.RegistryInUse { return plugin.RegistryInUse{} }
+	t.Cleanup(func() { piNPMBase, piRegistry = was, wasReg })
 	piForget(t)
 	return asked, texts, down
 }
@@ -69,13 +80,13 @@ func TestPiSearchAsksTheRegistryInUse(t *testing.T) {
 		fmt.Fprintf(w, `{"total":1,"objects":[%s]}`, pkg)
 	}))
 	t.Cleanup(reg.Close)
-	piRegistry = func() string { return reg.URL + "/" }
-	list, _, err := searchPiNPM("", 250, 0)
+	piRegistry = func() plugin.RegistryInUse { return plugin.RegistryInUse{URL: reg.URL + "/"} }
+	list, _, err := searchPiNPM(piRegistry(), "", 250, 0)
 	if err != nil || len(list) != 1 || list[0].Name != "pi-own" || asked.Load() != 0 {
 		t.Fatalf("registry in use: %v %+v, npm asked %d times", err, list, asked.Load())
 	}
 	regDown.Store(true)
-	list, _, err = searchPiNPM("", 250, 0)
+	list, _, err = searchPiNPM(piRegistry(), "", 250, 0)
 	if err != nil || len(list) != 1 || list[0].Name != "pi-npm" || asked.Load() != 1 {
 		t.Fatalf("registry can't search: %v %+v, npm asked %d times", err, list, asked.Load())
 	}
@@ -83,11 +94,11 @@ func TestPiSearchAsksTheRegistryInUse(t *testing.T) {
 
 func piForget(t *testing.T) {
 	piPopular.Lock()
-	piPopular.list, piPopular.at = nil, time.Time{}
+	piPopular.upstream, piPopular.list, piPopular.err, piPopular.until = "", nil, nil, time.Time{}
 	piPopular.Unlock()
 	t.Cleanup(func() {
 		piPopular.Lock()
-		piPopular.list, piPopular.at = nil, time.Time{}
+		piPopular.upstream, piPopular.list, piPopular.err, piPopular.until = "", nil, nil, time.Time{}
 		piPopular.Unlock()
 	})
 }
@@ -162,8 +173,8 @@ func TestPiMarketFromNPM(t *testing.T) {
 	if got := piNames(list); !slices.Equal(got, []string{"@big/pi-web", "pi-web-extra"}) {
 		t.Errorf("search = %v", got)
 	}
-	if !slices.Contains(*texts, "keywords:pi-package web") {
-		t.Errorf("npm was asked %q", *texts)
+	if got := texts(); !slices.Contains(got, "keywords:pi-package web") {
+		t.Errorf("npm was asked %q", got)
 	}
 
 	// npm not answering a search: the popular ones that match, and which
@@ -200,6 +211,206 @@ func TestPiMarketSnapshot(t *testing.T) {
 		if list[i].Downloads > list[i-1].Downloads {
 			t.Fatalf("snapshot isn't by downloads at %d: %v then %v", i, list[i-1], list[i])
 		}
+	}
+}
+
+func setLibraryNPMUpstream(t *testing.T, u string) {
+	t.Helper()
+	s, err := settings.LoadChecked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.NPMRegistry = u
+	if err := settings.Save(s); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPiConfiguredRegistrySearchAndLookup(t *testing.T) {
+	h := sandbox(t)
+	piCacheHere(t)
+	public, _, _ := piNPM(t, nil, nil)
+	piRegistry = plugin.Registry
+	var search, latest, scoped atomic.Int32
+	reg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.EscapedPath() {
+		case "/proxy/npm/-/v1/search":
+			search.Add(1)
+			q := r.URL.Query()
+			switch {
+			case q.Get("text") == "keywords:pi-package" && q.Get("size") == "250" && q.Get("from") == "0":
+				fmt.Fprintf(w, `{"total":251,"objects":[%s]}`, npmObject("pi-main", "General package", "", 25))
+			case q.Get("text") == "keywords:pi-package" && q.Get("size") == "250" && q.Get("from") == "250":
+				fmt.Fprint(w, `{"total":251,"objects":[]}`)
+			case q.Get("text") == "keywords:pi-package tablets & pens" && q.Get("size") == "100" && q.Get("from") == "0":
+				fmt.Fprintf(w, `{"total":1,"objects":[%s]}`, npmObject("pi-search-hit", "Uses tablets & pens", "", 3))
+			default:
+				t.Errorf("unexpected search: %s", r.URL)
+				http.NotFound(w, r)
+			}
+		case "/proxy/npm/pi-direct/latest":
+			latest.Add(1)
+			fmt.Fprint(w, `{"name":"pi-direct","version":"3.1.4","keywords":["pi-package"]}`)
+		default:
+			t.Errorf("unexpected upstream path: %s", r.URL.EscapedPath())
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(reg.Close)
+	scope := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scoped.Add(1)
+		if r.URL.EscapedPath() != "/private/@scope%2Fpi-tools/latest" || r.Header.Get("Authorization") != "Bearer test-scope-token" {
+			t.Errorf("scope was not requested with its matching npmrc credentials: %s", r.URL.EscapedPath())
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, `{"name":"@scope/pi-tools","version":"4.0.0","description":"Scoped package"}`)
+	}))
+	t.Cleanup(scope.Close)
+	write(t, filepath.Join(h, ".npmrc"), "registry="+piNPMBase+"\n@scope:registry="+scope.URL+"/private/\n"+strings.TrimPrefix(scope.URL, "http:")+"/private/:_authToken=test-scope-token\n")
+	setLibraryNPMUpstream(t, reg.URL+"/proxy/npm/")
+
+	if list, err := MarketPiPackages(""); err != nil || !slices.Equal(piNames(list), []string{"pi-main"}) {
+		t.Fatalf("configured popular list: %v, %v", piNames(list), err)
+	}
+	if list, err := MarketPiPackages("Tablets & Pens"); err != nil || !slices.Equal(piNames(list), []string{"pi-search-hit"}) {
+		t.Fatalf("configured search: %v, %v", piNames(list), err)
+	}
+	if d := PiDirectAt("pi-direct", nil); d == nil || d.Version != "3.1.4" || d.Source != "npm:pi-direct" {
+		t.Errorf("direct package: %+v", d)
+	}
+	if d := PiDirectAt("npm:@scope/pi-tools@^4", nil); d == nil || d.Description != "Scoped package" || d.Version != "^4" {
+		t.Errorf("scoped package with an exact install source: %+v", d)
+	}
+	if search.Load() != 3 || latest.Load() != 1 || scoped.Load() != 1 || public.Load() != 0 {
+		t.Errorf("requests: search=%d, latest=%d, scoped=%d, public=%d", search.Load(), latest.Load(), scoped.Load(), public.Load())
+	}
+}
+
+func TestPiConfiguredRegistryDoesNotFallBack(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		code int
+		body string
+		want string
+	}{
+		{"http failure", http.StatusServiceUnavailable, "unavailable", "503"},
+		{"invalid JSON", http.StatusOK, `{"objects":[`, "unexpected end"},
+		{"no search", http.StatusOK, `{"error":"search not supported"}`, "no objects array"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sandbox(t)
+			piCacheHere(t)
+			public, _, _ := piNPM(t, []string{npmObject("pi-public", "Public package", "", 10)}, nil)
+			piRegistry = plugin.Registry
+			var search, latest atomic.Int32
+			reg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/upstream/-/v1/search":
+					search.Add(1)
+				case "/upstream/pi-install-without-search/latest", "/upstream/@czottmann/pi-zai-api/latest":
+					latest.Add(1)
+				default:
+					t.Errorf("unexpected registry path: %s", r.URL.Path)
+				}
+				w.WriteHeader(tc.code)
+				fmt.Fprint(w, tc.body)
+			}))
+			t.Cleanup(reg.Close)
+			setLibraryNPMUpstream(t, reg.URL+"/upstream")
+
+			list, err := MarketPiPackages("")
+			var se *SearchError
+			if !errors.As(err, &se) || !strings.Contains(err.Error(), tc.want) || !slices.Contains(piNames(list), "pi-mcp-adapter") {
+				t.Errorf("popular list: %d packages (%v); want a search error and the shipped snapshot", len(list), err)
+			}
+			const spec = "npm:pi-install-without-search@1.2.3"
+			list, err = MarketPiPackages(spec)
+			if !errors.As(err, &se) || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("configured search error = %v", err)
+			}
+			if d := PiDirectAt(spec, list); d == nil || d.Source != spec || d.Version != "1.2.3" {
+				t.Errorf("failed metadata lookup hid the explicitly named install: %+v", d)
+			}
+			if d := PiDirectAt("pi-install-without-search", nil); d != nil {
+				t.Errorf("a bare search word without metadata became a package: %+v", d)
+			}
+			// This entry's shipped description includes its full npm: spec.
+			const builtinSpec = "npm:@czottmann/pi-zai-api"
+			list, _ = MarketPiPackages(builtinSpec)
+			if d := PiDirectAt(builtinSpec, list); d == nil || d.Source != builtinSpec {
+				t.Errorf("the shipped card hid the exact install: %+v", d)
+			}
+			if search.Load() != 3 || latest.Load() != 3 || public.Load() != 0 {
+				t.Errorf("requests: search=%d, latest=%d, public=%d", search.Load(), latest.Load(), public.Load())
+			}
+		})
+	}
+}
+
+func TestPiPopularCacheStaysWithItsUpstream(t *testing.T) {
+	sandbox(t)
+	piCacheHere(t)
+	public, _, down := piNPM(t, []string{npmObject("pi-before-explicit", "Public package", "", 10)}, nil)
+	automatic := piRegistry
+	if list, err := MarketPiPackages(""); err != nil || !slices.Equal(piNames(list), []string{"pi-before-explicit"}) {
+		t.Fatalf("automatic popular list = %v, %v", piNames(list), err)
+	}
+
+	piRegistry = plugin.Registry
+	var firstDown atomic.Bool
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if firstDown.Load() {
+			http.Error(w, "offline", http.StatusNotFound)
+			return
+		}
+		fmt.Fprintf(w, `{"total":1,"objects":[%s]}`, npmObject("pi-first-upstream", "Private package", "", 20))
+	}))
+	t.Cleanup(first.Close)
+	setLibraryNPMUpstream(t, first.URL)
+	if list, err := MarketPiPackages(""); err != nil || !slices.Equal(piNames(list), []string{"pi-first-upstream"}) {
+		t.Fatalf("first explicit upstream = %v, %v", piNames(list), err)
+	}
+	firstDown.Store(true)
+	piPopular.Lock()
+	piPopular.until = time.Time{}
+	piPopular.Unlock()
+	if list, err := MarketPiPackages(""); err == nil || !slices.Equal(piNames(list), []string{"pi-first-upstream"}) {
+		t.Fatalf("offline results from the same upstream = %v, %v", piNames(list), err)
+	}
+
+	var secondOnline atomic.Bool
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !secondOnline.Load() {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, `{"total":0,"objects":[]}`)
+	}))
+	t.Cleanup(second.Close)
+	setLibraryNPMUpstream(t, second.URL)
+	for _, phase := range []string{"after switch", "after restart"} {
+		list, err := MarketPiPackages("")
+		names := piNames(list)
+		if err == nil || !slices.Contains(names, "pi-mcp-adapter") || slices.Contains(names, "pi-first-upstream") || slices.Contains(names, "pi-before-explicit") {
+			t.Errorf("%s: got %d packages and err=%v; want only the shipped snapshot", phase, len(list), err)
+		}
+		piForget(t)
+	}
+	secondOnline.Store(true)
+	if list, err := MarketPiPackages(""); len(list) != 0 || err != nil {
+		t.Errorf("configured registry answered with no packages: got %d, err=%v", len(list), err)
+	}
+	if public.Load() != 1 {
+		t.Errorf("the public registry was asked %d times, want one in automatic mode", public.Load())
+	}
+
+	// Automatic mode's disk cache hasn't been overwritten by either explicit registry.
+	setLibraryNPMUpstream(t, "")
+	piRegistry = automatic
+	down.Store(true)
+	if list, err := MarketPiPackages(""); err != nil || !slices.Equal(piNames(list), []string{"pi-before-explicit"}) {
+		t.Errorf("restored automatic mode = %v, %v", piNames(list), err)
 	}
 }
 
@@ -427,11 +638,13 @@ func TestPiSearchFindsByNameOnNPMMirror(t *testing.T) {
 		}
 	}))
 	t.Cleanup(mirror.Close)
-	piRegistry = func() string { return mirror.URL }
+	piRegistry = func() plugin.RegistryInUse { return plugin.RegistryInUse{URL: mirror.URL} }
 	for _, q := range []string{"rename", "pi-rename"} {
 		list, err := MarketPiPackages(q)
 		if err != nil || !slices.Contains(piNames(list), "pi-rename") {
+			mu.Lock()
 			t.Errorf("%q: %v %v (asked %q)", q, piNames(list), err, texts)
+			mu.Unlock()
 		}
 		for _, p := range list {
 			if p.Name == "pi-rename" && (p.Source != "npm:pi-rename" || p.Version != "1.2.0" || p.Publisher != "shanelevs") {
@@ -526,7 +739,7 @@ func piRegistryFake(t *testing.T, latest map[string][]byte) *atomic.Int32 {
 		fmt.Fprintf(w, `{"error":"[NOT_FOUND] %s not found"}`, name)
 	}))
 	t.Cleanup(reg.Close)
-	piRegistry = func() string { return reg.URL }
+	piRegistry = func() plugin.RegistryInUse { return plugin.RegistryInUse{URL: reg.URL} }
 	return asked
 }
 

@@ -83,6 +83,44 @@ func TestSettingsSetGetReset(t *testing.T) {
 	}
 }
 
+func TestSettingsNPMRegistryAndPluginAlias(t *testing.T) {
+	settingsHome(t)
+	t.Setenv("BUN_CONFIG_REGISTRY", "https://automatic.example/npm")
+	out := func(args ...string) string {
+		t.Helper()
+		s, err := runOut(t, args...)
+		if err != nil {
+			t.Fatalf("magpie %s: %v", strings.Join(args, " "), err)
+		}
+		return strings.TrimSpace(s)
+	}
+	get := func(want string) {
+		t.Helper()
+		if got := out("settings", "get", "npmRegistry", "--json"); got != want {
+			t.Fatalf("explicit registry = %q, want %q", got, want)
+		}
+	}
+	const custom = "https://npm.example/repo"
+	get(`""`)
+	out("settings", "set", "npmRegistry", custom+"/")
+	get(`"` + custom + `"`)
+	if s := out("plugin", "registry"); !strings.HasPrefix(s, custom) || !strings.Contains(s, "npmRegistry") {
+		t.Fatalf("legacy query didn't identify the explicit registry: %q", s)
+	}
+	out("settings", "reset", "npmRegistry")
+	get(`""`)
+	if s := out("plugin", "registry"); !strings.HasPrefix(s, "https://automatic.example/npm") {
+		t.Fatalf("legacy query didn't return to automatic selection: %q", s)
+	}
+	out("plugin", "registry", custom)
+	get(`"` + custom + `"`)
+	out("plugin", "registry", "default")
+	get(`""`)
+	if s := settings.Load(); s.Theme != "dark" || s.Proxy != "http://127.0.0.1:7890" || !s.NoBird {
+		t.Error("changing the registry changed unrelated settings")
+	}
+}
+
 // A key or value that isn't one, and a flag where a value goes, write
 // nothing and say why.
 func TestSettingsRefusesAndWritesNothing(t *testing.T) {
@@ -96,6 +134,8 @@ func TestSettingsRefusesAndWritesNothing(t *testing.T) {
 		{"settings", "set", "usageAlert", "200"}, // the save's own range
 		{"settings", "set", "trayUsageEvery", "4"},
 		{"settings", "set", "checkinAt", "25:00"},
+		{"settings", "set", "npmRegistry", "ftp://npm.example/repo"},
+		{"plugin", "registry", "ftp://npm.example/repo"},
 		{"settings", "set", "vision", "nobody/nothing"},
 		{"settings", "set", "otel", `{"bogus":1}`},
 		{"settings", "set", "theme", "--help-me"},

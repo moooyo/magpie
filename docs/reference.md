@@ -4665,20 +4665,39 @@ credentials change before sending. Redirects are not followed.
 Backups without keys omit OTLP headers; restoring one preserves this machine's
 headers only when the collector endpoint is unchanged.
 
+## npm upstream
+
+Set **Settings → Network and sharing → Magpie-wide npm registry**, or run
+`magpie settings set npmRegistry https://registry.npmmirror.com`. Clear it
+with `magpie settings reset npmRegistry` to restore automatic selection.
+The Plugins page shows the effective default registry for plugins.
+
+An explicit HTTP(S) registry is used for Magpie's npm lookups, including
+plugin and Pi search and Agent and Codex version checks, and is passed to
+managed package managers. Magpie does not retry an explicit registry's
+failed search against npmjs or look up download counts on `api.npmjs.org`.
+An upstream without the search API can still install packages by name.
+
+The setting does not write a system `.npmrc` or change the shell's
+environment. Explicit package scopes and per-server choices still apply.
+Package managers may follow the URLs supplied by dependencies, lockfiles,
+or the chosen registry; this setting is not a network filter. Programs
+started independently use their own configuration. See [the registry
+contract](subsystems/provider-plugins.md#the-npm-upstream) for details.
+
 ## Mirrors
 
-The Plugins page's **Mirrors in China** (国内镜像) switch has what that page
-downloads asked of a mirror in China first and of its official address
-after: npm's registry (plugin packages, their versions and search) at
-`registry.npmmirror.com`, Bun's releases at npmmirror's binary mirror, and
-the plugin list at jsDelivr (`cdn.jsdelivr.net/gh/magpie-community/plugins`).
+The Plugins page's **Mirrors in China** (国内镜像) switch tries mirrors in
+China first and official addresses after: Bun's releases at npmmirror's
+binary mirror and the plugin list at jsDelivr
+(`cdn.jsdelivr.net/gh/magpie-community/plugins`). In automatic npm mode,
+this includes `registry.npmmirror.com` for npm's registry.
 Each is a copy of the very file — Bun's zip is still checked against Bun's
 SHA-256s, and a package against the integrity npm gave — and what the
-mirror hasn't copied yet is asked of the official address. npm's weekly
-download counts stay npmjs's own. `bun add` is pointed at npmmirror too,
-unless `BUN_CONFIG_REGISTRY` or `NPM_CONFIG_REGISTRY` names a registry
-already. The switch never sends anything through a proxy such as
-gh-proxy.
+mirror hasn't copied yet is asked of the official address. In automatic
+npm mode, weekly download counts still come from npmjs, and `bun add` is
+pointed at npmmirror unless a registry is already configured. The switch
+never sends anything through a proxy such as gh-proxy.
 
 Mirror fallback is off by default. Set `MAGPIE_MIRRORS=on` to use it. When
 it is on, the official source is tried first; a mirror is only tried after

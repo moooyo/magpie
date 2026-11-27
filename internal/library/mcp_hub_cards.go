@@ -79,9 +79,9 @@ var cards struct {
 	path string
 }
 
-// cardKey is s as the hub runs it, short.
-func cardKey(s *Server) string {
-	h := sha256.Sum256([]byte(hubKey(s)))
+// cardKey is the backend's key as the hub runs it, short.
+func cardKey(key string) string {
+	h := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(h[:8])
 }
 
@@ -108,17 +108,16 @@ func cardOf(s *Server) *hubCard {
 	defer cards.Unlock()
 	loadCards()
 	c, ok := cards.m[s.Name]
-	if !ok || c.Key != cardKey(s) {
+	if !ok || c.Key != cardKey(hubKey(s)) {
 		return nil
 	}
 	return &c
 }
 
-// noteCard keeps what s listed (ts) and said of itself, written to the
-// file only when it changed; the cards of servers the library no longer
-// has go with it.
-func noteCard(s *Server, says serverSays, ts []map[string]json.RawMessage) {
-	c := hubCard{Key: cardKey(s), Title: says.Title, Says: says.Says, Tools: []Tool{}}
+// noteCard keeps what s listed and said at its backend's key. A backend
+// on the previous registry must not overwrite a card on the current one.
+func noteCard(s *Server, key string, says serverSays, ts []map[string]json.RawMessage) {
+	c := hubCard{Key: cardKey(key), Title: says.Title, Says: says.Says, Tools: []Tool{}}
 	for _, t := range ts {
 		var name, desc string
 		if json.Unmarshal(t["name"], &name) != nil || name == "" {
@@ -136,6 +135,9 @@ func noteCard(s *Server, says serverSays, ts []map[string]json.RawMessage) {
 	mu.Unlock()
 	cards.Lock()
 	defer cards.Unlock()
+	if key != hubKey(s) {
+		return
+	}
 	loadCards()
 	if old, ok := cards.m[s.Name]; ok && old.Key == c.Key && old.Title == c.Title && old.Says == c.Says && slices.Equal(old.Tools, c.Tools) {
 		return

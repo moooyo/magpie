@@ -24,6 +24,9 @@ func TestFakeRunServer(t *testing.T) {
 	if logf == "" {
 		t.Skip("run by the run tests")
 	}
+	if f := os.Getenv("MAGPIE_FAKE_MCP_NPM_ENV"); f != "" {
+		captureMCPNPMEnv(t, f)
+	}
 	out := bufio.NewWriter(os.Stdout)
 	say := func(v any) {
 		b, _ := json.Marshal(v)

@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/lazyre"
+	"github.com/yetone/magpie/internal/npmregistry"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -43,9 +44,10 @@ var npmSpec = lazyre.New(`^((?:@[a-z0-9][a-z0-9._~-]*/)?[a-z0-9][a-z0-9._~-]*)(?
 
 // readNpx is s's npx line, ok false for anything else: a flag but -y
 // before the package (-p, --package, -c, a registry), or no -y, which
-// would have npx ask on the server's own stdin.
+// would have npx ask on the server's own stdin. A server with its own npm
+// configuration is left to npx: the background install gets none of s.Env.
 func readNpx(s *Server) (npxRun, bool) {
-	if s.Remote() || progName(s.Command) != "npx" {
+	if s.Remote() || progName(s.Command) != "npx" || npmInstallEnv(s.Env) || npmregistry.UserConfigUses(s.Env) {
 		return npxRun{}, false
 	}
 	yes := false
@@ -76,8 +78,17 @@ func (r npxRun) pinned() bool {
 
 var exactVersion = lazyre.New(`^\d+\.\d+\.\d+([-+].*)?$`)
 
-// npxDir is where magpie installs a spec: a folder of its own each.
-func npxDir(spec string) string {
+// npxDir is where magpie installs a spec, apart from the same spec from
+// another registry. With no setting, keep using the existing cache.
+func npxDir(spec, registry string) string {
+	if strings.HasPrefix(spec, "@") {
+		if scope := npmregistry.UserScope(spec); scope != "" {
+			spec = scope + "\x00" + spec
+		}
+	}
+	if registry != "" {
+		spec = registry + "\x00" + spec
+	}
 	h := sha256.Sum256([]byte(spec))
 	return filepath.Join(settings.Dir(), "mcp-npm", hex.EncodeToString(h[:8]))
 }
@@ -154,19 +165,21 @@ func npxBin(dir, name string) string {
 
 // npxDirect is s as node running the package's program, when magpie has
 // the package installed; s when it hasn't, with the install started.
-func npxDirect(s *Server) *Server {
+func npxDirect(s *Server, registry string) *Server {
 	r, ok := readNpx(s)
-	if !ok || npxInstall == nil {
+	if !ok || npxInstall == nil || registry != "" && s.Hub == HubDirect && strings.HasPrefix(r.name, "@") {
+		// A scoped package launched from an agent's project can use that
+		// project's npmrc, which the background installer cannot see.
 		return s
 	}
 	node := nodeBeside(s.Command)
 	if node == "" {
 		return s
 	}
-	dir := npxDir(r.spec)
+	dir := npxDir(r.spec, registry)
 	bin := npxBin(dir, r.name)
 	if bin == "" || !r.pinned() && npxStale(dir) {
-		npxStart(r, s.Command, dir, bin == "")
+		npxStart(r, s.Command, dir, registry, bin == "")
 	}
 	if bin == "" {
 		return s
@@ -192,7 +205,7 @@ var npxQueue struct {
 // npxStart installs the spec in the background, once at a time; new says
 // nothing is installed yet, and the agents are synced again once it is.
 // A failed install is tried again after an hour.
-func npxStart(r npxRun, npx, dir string, new bool) {
+func npxStart(r npxRun, npx, dir, registry string, new bool) {
 	npxQueue.Lock()
 	if npxQueue.busy == nil {
 		npxQueue.busy, npxQueue.failed = map[string]bool{}, map[string]time.Time{}
@@ -203,8 +216,9 @@ func npxStart(r npxRun, npx, dir string, new bool) {
 	}
 	npxQueue.busy[dir] = true
 	npxQueue.Unlock()
+	install, synced := npxInstall, npxSynced
 	go func() {
-		err := npxInstall(r.spec, npx, dir)
+		err := install(r.spec, npx, dir, registry)
 		npxQueue.Lock()
 		delete(npxQueue.busy, dir)
 		if err != nil {
@@ -215,8 +229,8 @@ func npxStart(r npxRun, npx, dir string, new bool) {
 			log.Printf("library: installing %s for its MCP server: %v", r.spec, err)
 			return
 		}
-		if new && npxBin(dir, r.name) != "" && npxSynced != nil {
-			npxSynced()
+		if new && npxBin(dir, r.name) != "" && synced != nil {
+			synced()
 		}
 	}()
 }
@@ -225,7 +239,7 @@ func npxStart(r npxRun, npx, dir string, new bool) {
 // test binary (testsLeaveTheMachine), which never reaches the registry.
 var npxInstall = realInstall
 
-func realInstall(spec, npx, dir string) error {
+func realInstall(spec, npx, dir, registry string) error {
 	npm := "npm"
 	if strings.ContainsAny(npx, `/\`) {
 		npm = filepath.Join(filepath.Dir(npx), "npm")
@@ -251,6 +265,9 @@ func realInstall(spec, npx, dir string) error {
 	defer cancel()
 	cmd := proc.CommandContext(ctx, npm, "install", "--prefix", dir, "--no-save", "--no-package-lock", "--no-audit", "--no-fund", "--loglevel=error", spec)
 	cmd.Dir = dir
+	if registry != "" {
+		cmd.Env = npmregistry.WithEnv(cmd.Environ(), registry)
+	}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return &npmError{err, strings.TrimSpace(string(out))}
 	}
@@ -290,18 +307,18 @@ func testsLeaveTheMachine() {
 func init() {
 	testsLeaveTheMachine()
 	npxSynced = func() {
-		if _, err := Sync(); err != nil {
+		if _, err := SyncMCP(); err != nil {
 			log.Printf("library: syncing after an MCP package install: %v", err)
 		}
 	}
 }
 
 // npxDirs are the folders of the packages the library's servers run.
-func (l *Library) npxDirs() map[string]bool {
+func (l *Library) npxDirs(registry string) map[string]bool {
 	dirs := map[string]bool{}
 	for _, s := range l.MCP {
 		if r, ok := readNpx(s); ok {
-			dirs[filepath.Base(npxDir(r.spec))] = true
+			dirs[filepath.Base(npxDir(r.spec, registry))] = true
 		}
 	}
 	return dirs
@@ -314,7 +331,7 @@ func npxPrune(keep map[string]bool) {
 	if npxInstall == nil {
 		return
 	}
-	root := filepath.Dir(npxDir(""))
+	root := filepath.Dir(npxDir("", ""))
 	des, _ := os.ReadDir(root)
 	for _, de := range des {
 		dir := filepath.Join(root, de.Name())

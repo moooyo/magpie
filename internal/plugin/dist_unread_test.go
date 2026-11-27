@@ -74,7 +74,7 @@ func TestDistReadSlowerThanAnAskIsntMissing(t *testing.T) {
 		t.Fatalf("kept %+v as what npm said, with the dist branch unread", e)
 	}
 	c, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	_, err := npmAsk(c, pkg)
+	_, err := npmAsk(c, Registry(), pkg)
 	cancel()
 	if errors.Is(err, errNotFound) || !errors.Is(err, errDistUnread) {
 		t.Fatalf("npmAsk with the dist branch unread: %v; want errDistUnread, not errNotFound", err)
@@ -107,7 +107,7 @@ func TestDistReadFailedIsntMissing(t *testing.T) {
 	if info, ok := Info(context.Background(), []string{pkg})[pkg]; ok {
 		t.Fatalf("with the dist branch failing the market says %+v; want it unknown", info)
 	}
-	if _, err := npmAsk(context.Background(), pkg); errors.Is(err, errNotFound) {
+	if _, err := npmAsk(context.Background(), Registry(), pkg); errors.Is(err, errNotFound) {
 		t.Fatalf("npmAsk with the dist branch failing: %v, said missing", err)
 	}
 	fail.Store(false)
@@ -116,7 +116,7 @@ func TestDistReadFailedIsntMissing(t *testing.T) {
 	}
 	// and a branch read that has no such package is missing, as before
 	const gone = "@magpie-community/opencode-nothing-auth"
-	if _, err := npmAsk(context.Background(), gone); !errors.Is(err, errNotFound) {
+	if _, err := npmAsk(context.Background(), Registry(), gone); !errors.Is(err, errNotFound) {
 		t.Fatalf("npmAsk of a package neither has: %v; want errNotFound", err)
 	}
 }
@@ -142,8 +142,8 @@ func TestStaleMissingIsUnknownWhileDistUnread(t *testing.T) {
 	npmEach, npmAll = 5*time.Second, 10*time.Second
 
 	npmMu.Lock()
-	npmCached()[pkg] = npmEntry{NPM{}, time.Now().Add(-2 * time.Hour)}
-	npmCached()[fresh] = npmEntry{NPM{}, time.Now().Add(-time.Minute)}
+	npmCached()[pkg] = npmEntry{At: time.Now().Add(-2 * time.Hour)}
+	npmCached()[fresh] = npmEntry{At: time.Now().Add(-time.Minute)}
 	npmMu.Unlock()
 
 	if info, ok := InfoCached([]string{pkg})[pkg]; ok {

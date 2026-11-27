@@ -36,7 +36,7 @@ func TestReadTaggedOwnWords(t *testing.T) {
 		raw, reg := githubRaw, npmRegistry
 		githubRaw, npmRegistry = srv.URL+"/raw", srv.URL+"/npm"
 		defer func() { githubRaw, npmRegistry = raw, reg }()
-		got, keep, known, err := readTagged(context.Background(), Tagged{Spec: "github:someone/magpie-officeace", Repo: "someone/magpie-officeace"}, "main")
+		got, keep, known, err := readTagged(context.Background(), Registry(), Tagged{Spec: "github:someone/magpie-officeace", Repo: "someone/magpie-officeace"}, "main")
 		if err != nil || !keep || !known {
 			t.Fatalf("read %s: %v kept %v known %v", pkg, err, keep, known)
 		}

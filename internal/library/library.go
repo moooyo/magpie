@@ -441,7 +441,7 @@ func changeLocked(f func(l *Library) error, mcp bool) (*Result, error) {
 	}
 	var res *Result
 	if mcp && was != nil && bytes.Equal(was, l.beyondMCP()) {
-		res = l.syncMCPOnly()
+		res = l.syncMCPOnly(false)
 	} else {
 		res = l.sync()
 	}

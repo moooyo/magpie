@@ -15,6 +15,7 @@ import (
 	"github.com/tidwall/jsonc"
 
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/npmregistry"
 )
 
 // projectMCPFiles is the file, in a project, each agent reads the project's
@@ -114,6 +115,42 @@ func formatOfRel(rel string) (mcpFormat, bool) {
 	return 0, false
 }
 
+// syncProjectRegistries updates MCP in the project and worktrees already
+// managed by Magpie, without reapplying skills, hooks or project instructions.
+func (l *Library) syncProjectRegistries(res *Result) {
+	for _, p := range l.Projects {
+		if len(p.Servers) == 0 && len(p.Plugins) == 0 && len(p.Wrote) == 0 && len(p.Trees) == 0 {
+			continue
+		}
+		fi, err := os.Stat(p.Dir)
+		if err != nil || !fi.IsDir() {
+			continue
+		}
+		_, servers, _ := l.withPlugins(p)
+		own := p.Servers
+		p.Servers = servers
+		hubs := l.projectHubs(p)
+		refresh := func(p *Project) {
+			l.syncProjectMCP(p, hubs, func(what string, err error) {
+				res.fail(p.Dir, "project:"+what, err)
+			})
+		}
+		refresh(p)
+		p.Servers = own
+		for _, tree := range p.Trees {
+			if p.MainOnly || len(tree.Wrote) == 0 {
+				continue
+			}
+			if fi, err := os.Stat(tree.Dir); err == nil && fi.IsDir() {
+				own := tree.Servers
+				tree.Servers = servers
+				refresh(tree)
+				tree.Servers = own
+			}
+		}
+	}
+}
+
 // syncProjectMCP writes the library's servers the project has into each
 // agent's file there, and takes out those magpie wrote that it no longer
 // has; an entry by the same name that magpie didn't write is left as it
@@ -124,6 +161,7 @@ func formatOfRel(rel string) (mcpFormat, bool) {
 // an entry of its own, and Codex's is written in its file here (Claude
 // Code's is in its own record of the project, syncClaudeLocal).
 func (l *Library) syncProjectMCP(p *Project, hubs map[string]*Server, fail func(what string, err error)) {
+	registry := npmregistry.Configured()
 	want := map[string][]*Server{} // the file → its servers
 	for _, name := range slices.Sorted(func(yield func(string) bool) {
 		for n := range p.Servers {
@@ -214,7 +252,7 @@ func (l *Library) syncProjectMCP(p *Project, hubs map[string]*Server, fail func(
 			}
 		}
 		for _, s := range want[rel] {
-			s := wroteStartup(f.withCmdVars(s), was[s.Name])
+			s := wroteStartup(f.withCmdVars(withNPMRegistry(s, registry, false)), was[s.Name])
 			old := entries[s.Name]
 			if old != nil && !slices.Contains(had, s.Name) {
 				fail("mcp:"+s.Name, fmt.Errorf("%s has a server called %s already that isn't magpie's: it's left as it is", rel, s.Name))

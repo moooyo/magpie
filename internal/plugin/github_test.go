@@ -864,3 +864,50 @@ func TestTaggedStandingAtOnce(t *testing.T) {
 		t.Fatalf("GitHub asked %d times, want once", n)
 	}
 }
+
+func TestTaggedStandingDoesNotUseAnotherUpstream(t *testing.T) {
+	registryHome(t)
+	t.Setenv("MAGPIE_PLUGIN_MARKET", "")
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	const first, second = "https://first.example/npm", "https://second.example/npm"
+	oldDisk := []Tagged{{Repo: "someone/plugin", Spec: "public-plugin"}}
+	b, err := json.Marshal(oldDisk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, taggedCache(), string(b))
+	taggedMu.Lock()
+	oldList, oldAt, oldUpstream, oldWhy := taggedL, taggedAt, taggedUpstream, taggedWhy
+	taggedL, taggedAt, taggedUpstream, taggedWhy = []Tagged{{Repo: "someone/plugin", Spec: "first-plugin"}}, time.Now(), first, nil
+	taggedMu.Unlock()
+	t.Cleanup(func() {
+		taggedMu.Lock()
+		defer taggedMu.Unlock()
+		taggedL, taggedAt, taggedUpstream, taggedWhy = oldList, oldAt, oldUpstream, oldWhy
+	})
+	if _, err := SetRegistry(first); err != nil {
+		t.Fatal(err)
+	}
+	if l, fresh, err := TaggedStanding(); len(l) != 1 || l[0].Spec != "first-plugin" || !fresh || err != nil {
+		t.Fatalf("same upstream: %v, fresh %v, %v", l, fresh, err)
+	}
+	if _, err := SetRegistry(second); err != nil {
+		t.Fatal(err)
+	}
+	if l, fresh, err := TaggedStanding(); l != nil || fresh || err != nil {
+		t.Fatalf("after switching: %v, fresh %v, %v", l, fresh, err)
+	}
+	func() {
+		taggedMu.Lock()
+		defer taggedMu.Unlock()
+		if l, fresh, err := TaggedStanding(); l != nil || fresh || err != nil {
+			t.Fatalf("while refreshing: %v, fresh %v, %v", l, fresh, err)
+		}
+	}()
+	if _, err := SetRegistry(""); err != nil {
+		t.Fatal(err)
+	}
+	if l, fresh, err := TaggedStanding(); len(l) != 1 || l[0].Spec != "public-plugin" || fresh || err != nil {
+		t.Fatalf("automatic mode: %v, fresh %v, %v", l, fresh, err)
+	}
+}

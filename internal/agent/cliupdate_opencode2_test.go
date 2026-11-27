@@ -8,28 +8,40 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 )
 
 // opencodeRegistry serves the newest of npm's two OpenCode packages as
 // npm did on 2026-11-05: @opencode/cli is OpenCode 2, opencode-ai
 // OpenCode 1 only.
-func opencodeRegistry(t *testing.T) {
+func opencodeRegistry(t *testing.T, configured bool) {
 	t.Helper()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	prefix := ""
+	if configured {
+		prefix = "/mirror"
+	}
 	reg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/@opencode/cli/latest":
+		case prefix + "/@opencode/cli/latest":
 			w.Write([]byte(`{"name":"@opencode/cli","version":"2.2.5"}`))
-		case "/opencode-ai/latest":
+		case prefix + "/opencode-ai/latest":
 			w.Write([]byte(`{"name":"opencode-ai","version":"1.19.5"}`))
 		default:
+			t.Errorf("unexpected version lookup at %s", r.URL.Path)
 			http.NotFound(w, r)
 		}
 	}))
 	oldReg := npmRegistry
 	npmRegistry = reg.URL + "/"
-	versions, latests = memo{}, memo{}
-	t.Cleanup(func() { reg.Close(); npmRegistry = oldReg; versions, latests = memo{}, memo{} })
+	versions, latests, wslProbes = memo{}, memo{}, memo{}
+	t.Cleanup(func() { reg.Close(); npmRegistry = oldReg; versions, latests, wslProbes = memo{}, memo{}, memo{} })
+	if configured {
+		setCLIRegistryForTest(t, reg.URL+prefix)
+	}
 }
 
 // An OpenCode from its installer, in ~/.opencode/bin (OpenCode 2's
@@ -42,18 +54,23 @@ func TestUpdateCLIOpenCodeKeepsItsLine(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("a shell script as the CLI")
 	}
-	for _, c := range []struct{ has, latest string }{
-		{"2.2.4", "2.2.5"},
-		{"1.19.4", "1.19.5"},
+	for _, c := range []struct {
+		name, has, latest string
+		configured        bool
+	}{
+		{"automatic 2.x", "2.2.4", "2.2.5", false},
+		{"automatic 1.x", "1.19.4", "1.19.5", false},
+		{"configured 2.x", "2.2.4", "2.2.5", true},
+		{"configured 1.x", "1.19.4", "1.19.5", true},
 	} {
-		t.Run(c.has, func(t *testing.T) {
+		t.Run(c.name, func(t *testing.T) {
 			tmp, _ := filepath.EvalSymlinks(t.TempDir())
 			verFile := filepath.Join(tmp, "version")
 			os.WriteFile(verFile, []byte("opencode v"+c.has+"\n"), 0o644)
 			oc := file(t, filepath.Join(tmp, "home/.opencode/bin/opencode"), "#!/bin/sh\n/bin/cat "+verFile+"\n")
 			bin := link(t, oc, filepath.Join(tmp, "bin/opencode"))
 			t.Setenv("PATH", filepath.Dir(bin))
-			opencodeRegistry(t)
+			opencodeRegistry(t, c.configured)
 			oldRun := runUpdate
 			var ran [][]string
 			runUpdate = func(_ context.Context, u *updater) ([]byte, error) {
@@ -72,6 +89,44 @@ func TestUpdateCLIOpenCodeKeepsItsLine(t *testing.T) {
 			}
 			if len(ran) != 1 || !reflect.DeepEqual(ran[0], []string{bin, "upgrade", c.latest}) {
 				t.Errorf("ran %q", ran)
+			}
+		})
+	}
+}
+
+func TestWSLOpenCodeKeepsItsLineWithConfiguredRegistry(t *testing.T) {
+	for _, c := range []struct{ has, latest string }{{"1.19.4", "1.19.5"}, {"2.2.4", "2.2.5"}} {
+		t.Run(c.has, func(t *testing.T) {
+			opencodeRegistry(t, true)
+			const bin = "/home/me/.opencode/bin/opencode"
+			fakeWSL(t, "Ubuntu\n", "Ubuntu\n", map[string]string{
+				"Ubuntu": "home:/home/me\ndir:.config/opencode\nbin:opencode " + bin + "\n",
+			}, map[string]string{"Ubuntu": t.TempDir()})
+			version := c.has
+			probe := wslRun
+			wslRun = func(timeout time.Duration, args ...string) ([]byte, error) {
+				if len(args) > 5 && args[3] == "sh" && args[4] == "-c" && strings.Contains(args[5], "readlink") {
+					return []byte("bin:" + bin + "\nreal:" + bin + "\ncode:0\nver:opencode " + version + "\n"), nil
+				}
+				return probe(timeout, args...)
+			}
+			old := wslRunUpdate
+			t.Cleanup(func() { wslRunUpdate = old })
+			var ran []string
+			wslRunUpdate = func(_ time.Duration, u *updater) ([]byte, error) {
+				ran = slices.Clone(u.cmd)
+				version = c.latest
+				return nil, nil
+			}
+			a := &Agent{ID: "opencode@wsl:Ubuntu", WSL: "Ubuntu", Name: "OpenCode"}
+			if got, ok := a.CLI(); !ok || got.Via != "self" || got.Latest != c.latest || !got.Update {
+				t.Errorf("before: %+v, %v", got, ok)
+			}
+			if got, err := a.UpdateCLI(); err != nil || got.Version != c.latest || got.Update {
+				t.Errorf("after: %+v, %v", got, err)
+			}
+			if want := []string{bin, "upgrade", c.latest}; !slices.Equal(ran, want) {
+				t.Errorf("ran %q, want %q", ran, want)
 			}
 		})
 	}

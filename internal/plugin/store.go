@@ -623,6 +623,7 @@ func notPlugin(target string) error {
 // with Update all still said an update was out, pinned where it was). A
 // pinned one already at npm's newest stays as its spec says.
 func Update(ctx context.Context) error {
+	ctx = withRegistry(ctx, Registry())
 	var errs []error
 	for _, e := range Load().Plugins {
 		if !IsPath(e.Spec) {
@@ -998,13 +999,11 @@ func plural(n int, unit string) string {
 // didn't say; what it says is kept, as Info keeps it (tests stub it).
 var newestOf = func(ctx context.Context, name string) string {
 	c, cancel := context.WithTimeout(ctx, checkEach)
-	info, err := npmAsk(c, name)
+	r := registryFor(ctx)
+	info, err := npmAsk(c, r, name)
 	cancel()
 	if err == nil || errors.Is(err, errNotFound) {
-		npmMu.Lock()
-		npmCached()[name] = npmEntry{info, time.Now()}
-		saveNPM()
-		npmMu.Unlock()
+		keepNPM(r, name, info)
 	}
 	if err != nil {
 		return ""

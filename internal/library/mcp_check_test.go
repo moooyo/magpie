@@ -39,6 +39,9 @@ func TestFakeMCPServer(t *testing.T) {
 		wd, _ := os.Getwd()
 		os.WriteFile(f, []byte(wd+"\n"+os.Getenv("PWD")), 0o644)
 	}
+	if f := os.Getenv("MAGPIE_FAKE_MCP_NPM_ENV"); f != "" {
+		captureMCPNPMEnv(t, f)
+	}
 	if mode == "needcwd" {
 		// A server that writes into its working directory on start (the
 		// doris-mcp-server shape in #1727). Fail loudly if "." is not writable.

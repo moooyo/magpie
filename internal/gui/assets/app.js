@@ -20455,6 +20455,7 @@ function renderSettings() {
   renderPluginCheckins(s);
   renderTrayUsage(s, keep);
   renderProxy(s, keep);
+  window.renderNPMRegistry ? renderNPMRegistry(s) : import("./registry.js").then(() => renderNPMRegistry(prefs), statusErr);
   window.renderSavedProxies ? renderSavedProxies(s) : import("./proxies.js").then(() => renderSavedProxies(s), () => {});
   renderGitHubToken(s);
   renderImages(s, keep);
@@ -23049,7 +23050,8 @@ function prefsKeep(s) {
 // savePrefs sends what the page was drawn with (prefsBase) and the choice
 // made on it. Saves go one after another, each with the choices before it:
 // two quick ones (a theme, then a language) undid each other. The page is
-// drawn again once the last is in.
+// drawn again once the last is in. The Promise returns a save's error, if
+// any, so its editor can keep the draft and show the error in the row.
 let prefsBase = {}, prefsQueue = Promise.resolve(), prefsQueued = 0;
 function savePrefs(body) {
   const change = Object.fromEntries(Object.entries(body).filter(([k, v]) => JSON.stringify(v) !== JSON.stringify(prefsBase[k])));
@@ -23061,15 +23063,16 @@ function savePrefs(body) {
       prefs = await api("settings", { ...prefsKeep(prefs), ...change });
       if (state) state.settings = prefs;
     } catch (e) {
-      failed = true;
-      statusErr(e);
+      failed = e;
+      if ("npmRegistry" in change) statusTErr(e); else statusErr(e);
     }
-    if (--prefsQueued) return;
+    if (--prefsQueued) return failed;
     // what is saved, a choice that failed put back
     const spoke = applyPrefs(prefs);
     renderSettings();
     if (spoke) { renderAgents(); providers = null; usage = null; }
     if (!failed) status(t("Saved"), "ok", 1500);
+    return failed;
   }));
   return prefsQueue;
 }

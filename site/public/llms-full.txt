@@ -10305,7 +10305,13 @@ From China, npm and GitHub are often slow or unreachable when installing plugins
 - **Bun**: npmmirror's binary mirror.
 - **The plugin list**: jsDelivr (`cdn.jsdelivr.net/gh/magpie-community/plugins`).
 
-What the mirror hasn't copied yet is asked of the official address. npm's weekly download counts stay npmjs's own. `bun add` is pointed at npmmirror too, unless `BUN_CONFIG_REGISTRY` or `NPM_CONFIG_REGISTRY` names a registry already. The switch never sends anything through a proxy such as gh-proxy.
+What the mirror hasn't copied yet is asked of the official address. In automatic npm mode, weekly download counts still come from npmjs, and `bun add` is pointed at npmmirror unless you already configured a registry. The switch never sends anything through a proxy such as gh-proxy.
+
+## Use one npm upstream across Magpie
+
+Set Magpie-wide npm registry in Settings → Network and sharing, or run `magpie settings set npmRegistry https://registry.npmmirror.com`. When set, Magpie uses it for plugin and Pi searches, version checks, and package managers it starts, without silently retrying on npmjs or asking npmjs for download counts. Clear the field or run `magpie settings reset npmRegistry` to restore automatic selection.
+
+Scope overrides and explicit MCP server settings still apply. This does not change the system npm configuration or restrict a package manager from following a package's explicit download URL.
 
 ## Installs and updates through a mirror or proxy
 
@@ -11360,7 +11366,7 @@ Agents now reach its models as `acme/acme-coder`, the same way as any other prov
 - **Bun..** magpie downloads Bun the first time a plugin is added, and runs every plugin on it. Bun runs TypeScript as is, so an entry can be `index.ts`.
 - **One host process..** Every plugin that is on loads into one Bun process, started the first time one is needed. magpie and the host talk over stdin and stdout, one JSON message a line. Anything a plugin prints, `console.log` and `process.stdout` included, is sent to stderr. magpie logs it as `plugin: …`.
 - **Installing..** An npm package is installed with `bun add`, with its install scripts left unrun, as OpenCode installs plugins. A dependency that needs a `postinstall` build won’t work.
-- Packages come from the npm registry you already use: the `registry=` in your `~/.npmrc`, `install.registry` in `~/.bunfig.toml`, or `NPM_CONFIG_REGISTRY` / `BUN_CONFIG_REGISTRY` in your shell, before the Mirrors in China switch. A token your `.npmrc` keeps for that registry is sent to it alone. To use another, change npm registry on Plugins → Discover, or run `magpie plugin registry <url>` (`default` goes back).
+- Set the [Magpie-wide npm registry](https://usemagpie.ai/docs/mirrors.html#npm-upstream) under Settings → Network and sharing for plugins and other Magpie-managed npm lookups and installs. Leave it blank to use the registry from your shell, Bun config or `.npmrc` before the Mirrors in China switch. Package scopes configured in `.npmrc` still apply.
 - A git repository is fetched by Bun: `github:owner/repo[#ref]`, `git+https://…` or `owner/repo`.
 - A path to a folder or file is loaded where it is.
 

@@ -25,6 +25,7 @@ import (
 
 	"github.com/yetone/magpie/internal/ghtoken"
 	"github.com/yetone/magpie/internal/lastgood"
+	"github.com/yetone/magpie/internal/npmregistry"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/steady"
 	"github.com/yetone/magpie/internal/update"
@@ -50,6 +51,8 @@ type Waiting struct {
 	Version string `json:"version"`
 	Latest  string `json:"latest"`
 	Git     bool   `json:"git,omitempty"`
+	// Upstream distinguishes a version from a different explicit registry.
+	Upstream string `json:"upstream,omitempty"`
 }
 
 // Updated is a plugin magpie updated by itself.
@@ -182,7 +185,10 @@ func PendingUpdates() Updates {
 	updatesMu.Lock()
 	defer updatesMu.Unlock()
 	u := readUpdates()
-	u.Waiting = slices.DeleteFunc(u.Waiting, waitsNoMore(installedNow()))
+	upstream, settled := npmregistry.Configured(), waitsNoMore(installedNow())
+	u.Waiting = slices.DeleteFunc(u.Waiting, func(w Waiting) bool {
+		return !w.Git && w.Upstream != upstream || settled(w)
+	})
 	if u.Waiting == nil {
 		u.Waiting = []Waiting{}
 	}
@@ -209,6 +215,9 @@ func LastUpdated(pkg string, since time.Time) (Updated, bool) {
 // waiting. The plugins updated are loaded again, a reply streaming
 // through the old ones finishing first.
 func CheckUpdates(ctx context.Context) (Updates, error) {
+	r := Registry()
+	upstream := r.upstream()
+	ctx = withRegistry(ctx, r)
 	var es, gits []Entry
 	var names []string
 	for _, e := range Load().Plugins {
@@ -236,18 +245,21 @@ func CheckUpdates(ctx context.Context) (Updates, error) {
 		}
 	}
 	for _, e := range es {
+		if npmregistry.Configured() != upstream {
+			break // don't apply a version found before the registry changed
+		}
 		pkg, have, now := Name(e.Spec), Installed(e.Spec), latest[Name(e.Spec)]
 		if e.Off || have == "" || now == "" || !update.Newer(now, have) {
 			continue
 		}
 		if !Official(pkg) || Pinned(e.Spec) {
-			waiting = append(waiting, Waiting{Spec: e.Spec, Package: pkg, Version: have, Latest: now})
+			waiting = append(waiting, Waiting{Spec: e.Spec, Package: pkg, Version: have, Latest: now, Upstream: upstream})
 			continue
 		}
 		if err := installNewest(ctx, pkg, now); err != nil {
 			errs = append(errs, err)
 			log.Printf("updating the plugin %s: %s", pkg, err)
-			waiting = append(waiting, Waiting{Spec: e.Spec, Package: pkg, Version: have, Latest: now})
+			waiting = append(waiting, Waiting{Spec: e.Spec, Package: pkg, Version: have, Latest: now, Upstream: upstream})
 			continue
 		}
 		v := Installed(e.Spec)
@@ -259,8 +271,10 @@ func CheckUpdates(ctx context.Context) (Updates, error) {
 	}
 	updatesMu.Lock()
 	u := readUpdates()
-	u.Checked = time.Now().UTC().Truncate(time.Second)
-	u.Waiting = waiting
+	if upstream == npmregistry.Configured() {
+		u.Checked = time.Now().UTC().Truncate(time.Second)
+		u.Waiting = waiting
+	}
 	u.Updated = append(u.Updated, made...)
 	if n := len(u.Updated); n > keepUpdated {
 		u.Updated = u.Updated[n-keepUpdated:]
@@ -390,6 +404,7 @@ var checkEach = 15 * time.Second
 // for the reader (someone else's, or pinned) wait for them as the
 // background look's do, putting the dot on Plugins.
 func CheckNow(ctx context.Context) VersionChecks {
+	r := Registry()
 	es := Load().Plugins
 	out := make([]VersionCheck, len(es))
 	var wg sync.WaitGroup
@@ -443,13 +458,10 @@ func CheckNow(ctx context.Context) VersionChecks {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			cctx, cancel := context.WithTimeout(ctx, checkEach)
-			info, err := npmAsk(cctx, c.Package)
+			info, err := npmAsk(cctx, r, c.Package)
 			cancel()
 			if err == nil || errors.Is(err, errNotFound) {
-				npmMu.Lock()
-				npmCached()[c.Package] = npmEntry{info, time.Now()}
-				saveNPM()
-				npmMu.Unlock()
+				keepNPM(r, c.Package, info)
 			}
 			if err == nil && info.Version == "" {
 				err = errors.New("npm named no version")
@@ -470,6 +482,10 @@ func CheckNow(ctx context.Context) VersionChecks {
 	// the updates found wait for the reader, as the background look's do;
 	// one npm didn't answer for waits as it did
 	updatesMu.Lock()
+	if r.upstream() != npmregistry.Configured() {
+		updatesMu.Unlock()
+		return VersionChecks{At: now, Plugins: []VersionCheck{}}
+	}
 	u := readUpdates()
 	asked := map[string]bool{}
 	var waiting []Waiting
@@ -483,11 +499,11 @@ func CheckNow(ctx context.Context) VersionChecks {
 		case c.Head != "":
 			waiting = append(waiting, Waiting{Spec: c.Spec, Package: c.Package, Version: c.Commit, Latest: c.Head, Git: true})
 		default:
-			waiting = append(waiting, Waiting{Spec: c.Spec, Package: c.Package, Version: c.Version, Latest: c.Latest})
+			waiting = append(waiting, Waiting{Spec: c.Spec, Package: c.Package, Version: c.Version, Latest: c.Latest, Upstream: r.upstream()})
 		}
 	}
 	for _, w := range u.Waiting {
-		if !asked[w.Package] {
+		if !asked[w.Package] && (w.Git || w.Upstream == r.upstream()) {
 			waiting = append(waiting, w)
 		}
 	}

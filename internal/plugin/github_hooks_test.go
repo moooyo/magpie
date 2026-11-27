@@ -45,7 +45,7 @@ func TestTaggedHooksAlone(t *testing.T) {
 		mu.Lock()
 		asked = nil
 		mu.Unlock()
-		return readTagged(context.Background(), Tagged{Spec: "github:" + repo, Repo: repo}, "main")
+		return readTagged(context.Background(), Registry(), Tagged{Spec: "github:" + repo, Repo: repo}, "main")
 	}
 	got, keep, known, err := read("IvanXxxxyyuffff/magpie-system-prompt-file")
 	if !keep || !known || err != nil || got.Kind != "hooks" || got.Spec != "github:IvanXxxxyyuffff/magpie-system-prompt-file" ||

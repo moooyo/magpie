@@ -24,6 +24,7 @@ type wslCheck struct {
 	mu     sync.Mutex
 	probes []string
 	runs   [][]string
+	cmd    *exec.Cmd
 	mode   string
 }
 
@@ -57,6 +58,7 @@ func fakeWSLCheck(t *testing.T, up ...string) *wslCheck {
 		c := tl.Command(ctx, args...)
 		w.mu.Lock()
 		w.runs = append(w.runs, slices.Clone(c.Args))
+		w.cmd = c
 		mode := w.mode
 		w.mu.Unlock()
 		c.Err = nil
@@ -187,7 +189,39 @@ func TestCheckMixedServerEachSide(t *testing.T) {
 	// the agents moving from here into WSL is a check of its own
 	a, b := *s, *s
 	a.Agents, b.Agents = []string{"claude"}, []string{"claude@wsl:Ubuntu"}
-	if healthKey(&a, nil) == healthKey(&b, nil) {
+	if healthKey(&a, nil, "") == healthKey(&b, nil, "") {
 		t.Fatal("a server moved into WSL keeps its check from Windows")
+	}
+}
+
+func TestMCPCheckWSLNPMRegistryKeepsWSLENV(t *testing.T) {
+	w := fakeWSLCheck(t, "Ubuntu")
+	const registry = "https://wsl.example/npm"
+	const inherited = "PATHS/lp:NPM_CONFIG_REGISTRY/w:FROM_WINDOWS/u"
+	t.Setenv("WSLENV", inherited)
+	setMCPTestRegistry(t, registry)
+	s := &Server{Name: "npm-wsl", Transport: "stdio", Command: "npx", Args: []string{"-y", "demo-mcp"}, Agents: []string{"codex@wsl:Ubuntu"},
+		Env: map[string]string{fakeMode: "ok", "PATHS": `C:\work`, "FROM_WINDOWS": "preserved"}}
+	if h := CheckServer(t.Context(), s); h.State != "ok" {
+		t.Fatalf("WSL check: %+v", h)
+	}
+	args := w.runs[0][7:]
+	if len(args) < 4 || args[0] != "/usr/bin/env" || !slices.Contains(args, "NPM_CONFIG_REGISTRY="+registry+"/") ||
+		!slices.Contains(args, "npm_config_registry="+registry+"/") || !slices.Contains(args, "BUN_CONFIG_REGISTRY="+registry+"/") ||
+		!slices.Equal(args[len(args)-2:], s.Args) {
+		t.Fatalf("WSL command has no scoped registry environment: %q", args)
+	}
+	if !slices.Contains(w.cmd.Env, "WSLENV="+inherited+":"+fakeMode) {
+		t.Fatalf("WSLENV lost its explicit names or flags: %v", wslOwnNames(w.cmd.Env, s.Env))
+	}
+
+	// Explicit --registry goes to the distro unchanged, without any global
+	// registry assignments trying to override it.
+	s.Args = []string{"--registry", "https://other.example/", "-y", "demo-mcp"}
+	if h := CheckServer(t.Context(), s); h.State != "ok" {
+		t.Fatalf("WSL check with override: %+v", h)
+	}
+	if got := w.runs[1][8:]; !slices.Equal(got, s.Args) {
+		t.Fatalf("WSL command with override: %q, want %q", got, s.Args)
 	}
 }

@@ -50,7 +50,7 @@ func TestEnvRefsFromLoginShell(t *testing.T) {
 			t.Fatalf("got %+v, want ok with 3 tools", hl)
 		}
 		// the router starts it the same way
-		c, err := dialHub(context.Background(), s, nil)
+		c, err := dialHub(context.Background(), s, nil, "")
 		if err != nil {
 			t.Fatalf("router: %v", err)
 		}
@@ -75,7 +75,7 @@ func TestEnvRefsFromLoginShell(t *testing.T) {
 		if hl := CheckServer(context.Background(), s); hl.State != "ok" || hl.Tools != 2 {
 			t.Fatalf("got %+v, want ok with 2 tools", hl)
 		}
-		c, err := dialHub(context.Background(), s, nil)
+		c, err := dialHub(context.Background(), s, nil, "")
 		if err != nil {
 			t.Fatalf("router: %v", err)
 		}

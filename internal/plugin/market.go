@@ -22,6 +22,7 @@ import (
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/ghtoken"
 	"github.com/yetone/magpie/internal/netproxy"
+	"github.com/yetone/magpie/internal/npmregistry"
 	"github.com/yetone/magpie/internal/source"
 	"github.com/yetone/magpie/internal/update"
 )
@@ -105,14 +106,15 @@ var (
 // npmEntry is what npm said of a package, and when; kept on disk beside
 // the market's copy, so a magpie just started shows it before npm answers.
 type npmEntry struct {
-	Info NPM       `json:"info"`
-	At   time.Time `json:"at"`
+	Info     NPM       `json:"info"`
+	At       time.Time `json:"at"`
+	Upstream string    `json:"upstream,omitempty"`
 }
 
 // Where npm is asked, moved by tests; how many packages are asked at once;
 // how long one is waited for, and all of them.
 var (
-	npmRegistry  = "https://registry.npmjs.org"
+	npmRegistry  = npmregistry.Default
 	npmDownloads = "https://api.npmjs.org"
 	npmAtOnce    = 6
 	npmEach      = 6 * time.Second
@@ -130,6 +132,17 @@ func npmCached() map[string]npmEntry {
 		}
 	}
 	return npmCache
+}
+
+func keepNPM(r RegistryInUse, name string, info NPM) {
+	upstream := r.upstream()
+	if upstream != npmregistry.Configured() {
+		return // the request began before the upstream changed
+	}
+	npmMu.Lock()
+	defer npmMu.Unlock()
+	npmCached()[name] = npmEntry{Info: info, At: time.Now(), Upstream: upstream}
+	saveNPM()
 }
 
 // ReloadInfo forgets what npm said, as kept in memory: the next ask reads
@@ -156,12 +169,13 @@ func saveNPM() {
 // InfoCached is what npm said last of each package it was asked of, however
 // long ago, without asking again; a package never asked isn't in it.
 func InfoCached(names []string) map[string]NPM {
+	upstream := npmregistry.Configured()
 	npmMu.Lock()
 	defer npmMu.Unlock()
 	c := npmCached()
 	out := map[string]NPM{}
 	for _, n := range names {
-		if e, ok := c[n]; ok && !e.missingStale(time.Hour) {
+		if e, ok := c[n]; ok && e.Upstream == upstream && !e.missingStale(time.Hour) {
 			out[n] = e.Info
 		}
 	}
@@ -357,6 +371,7 @@ func Info(ctx context.Context, names []string) map[string]NPM {
 // infoWithin is Info asking npm of each package it last answered for over
 // age ago; 0 asks of every one.
 func infoWithin(ctx context.Context, names []string, age time.Duration) map[string]NPM {
+	r := registryFor(ctx)
 	out := map[string]NPM{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -376,10 +391,12 @@ func infoWithin(ctx context.Context, names []string, age time.Duration) map[stri
 		asked[n] = true
 		e, hit := cache[n]
 		said := false
-		if hit {
-			// what it said last, until it says otherwise
+		if hit && e.Upstream == r.upstream() {
+			// what this upstream said last, until it says otherwise
 			if !e.missingStale(time.Hour) {
+				mu.Lock()
 				out[n], said = e.Info, true
+				mu.Unlock()
 			}
 			if time.Since(e.At) < age {
 				continue
@@ -400,15 +417,12 @@ func infoWithin(ctx context.Context, names []string, age time.Duration) map[stri
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			c, cancel := context.WithTimeout(bg, npmEach)
-			info, ok := npmInfo(c, n)
+			info, err := npmAsk(c, r, n)
 			cancel()
-			if !ok {
+			if err != nil && !errors.Is(err, errNotFound) {
 				return // npm didn't answer: what it said last
 			}
-			npmMu.Lock()
-			npmCached()[n] = npmEntry{info, time.Now()}
-			saveNPM()
-			npmMu.Unlock()
+			keepNPM(r, n, info)
 			mu.Lock()
 			if ctx.Err() == nil {
 				out[n] = info
@@ -487,24 +501,14 @@ func repoURL(v any) string {
 	return s
 }
 
-func npmInfo(ctx context.Context, name string) (NPM, bool) {
-	info, err := npmAsk(ctx, name)
-	if err != nil {
-		return NPM{}, errors.Is(err, errNotFound) // not on npm: known, and kept
-	}
-	return info, true
-}
-
 // npmAsk is what npm says of the package now, or why it said nothing:
 // errNotFound when it has no such package.
-func npmAsk(ctx context.Context, name string) (NPM, error) {
+func npmAsk(ctx context.Context, r RegistryInUse, name string) (NPM, error) {
 	var info NPM
 	var wg sync.WaitGroup
 	var latestErr error
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		b, err := fetchNPM(ctx, name, "/"+npmPath(name)+"/latest", 1<<20)
+	wg.Go(func() {
+		b, err := fetchNPMFrom(ctx, r, name, "/"+npmPath(name)+"/latest", 1<<20)
 		if err != nil {
 			latestErr = err
 			return
@@ -515,19 +519,22 @@ func npmAsk(ctx context.Context, name string) (NPM, error) {
 			return
 		}
 		info = npmOf(l)
-	}()
+	})
 	var weekly int
-	go func() {
-		defer wg.Done()
-		b, err := fetchJSON(ctx, npmDownloads+"/downloads/point/last-week/"+npmPath(name), 64<<10)
-		if err != nil {
-			return
-		}
-		var d struct{ Downloads int }
-		if json.Unmarshal(b, &d) == nil {
-			weekly = d.Downloads
-		}
-	}()
+	// Public download counts are not part of the registry protocol. An
+	// explicit upstream must not disclose its package names to npm's API.
+	if r.upstream() == "" {
+		wg.Go(func() {
+			b, err := fetchJSON(ctx, npmDownloads+"/downloads/point/last-week/"+npmPath(name), 64<<10)
+			if err != nil {
+				return
+			}
+			var d struct{ Downloads int }
+			if json.Unmarshal(b, &d) == nil {
+				weekly = d.Downloads
+			}
+		})
+	}
 	wg.Wait()
 	// a @magpie-community package npm doesn't have yet, or has an older
 	// version of, is as the community repo's dist branch has it, which
@@ -578,6 +585,7 @@ func Search(ctx context.Context, q string) ([]Hit, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	r := Registry()
 	var (
 		wg       sync.WaitGroup
 		oc, pi   []Hit
@@ -588,7 +596,7 @@ func Search(ctx context.Context, q string) ([]Hit, error) {
 		defer wg.Done()
 		// a plugin, not a tool that mentions OpenCode: its name says so,
 		// or its keywords name an OpenCode plugin
-		oc, ocE = searchNPM(ctx, q+" opencode", func(text string, _ []string) bool {
+		oc, ocE = searchNPMFrom(ctx, r, q+" opencode", func(text string, _ []string) bool {
 			return strings.Contains(text, "opencode") && (strings.Contains(text, "auth") || strings.Contains(text, "plugin") || strings.Contains(text, "provider"))
 		})
 	}()
@@ -596,7 +604,7 @@ func Search(ctx context.Context, q string) ([]Hit, error) {
 		defer wg.Done()
 		// a pi package that signs in to a provider or brings one; one
 		// that only adds pi a command or a tool has nothing for magpie
-		pi, piE = searchNPM(ctx, "keywords:pi-package "+q, func(text string, kw []string) bool {
+		pi, piE = searchNPMFrom(ctx, r, "keywords:pi-package "+q, func(text string, kw []string) bool {
 			return slices.Contains(kw, "pi-package") && (strings.Contains(text, "auth") || strings.Contains(text, "provider"))
 		})
 	}()
@@ -617,12 +625,17 @@ func Search(ctx context.Context, q string) ([]Hit, error) {
 // searchNPM is npm's search for text, the packages keep says are plugins
 // (given their name and keywords, lowercased, and the keywords).
 func searchNPM(ctx context.Context, text string, keep func(string, []string) bool) ([]Hit, error) {
+	return searchNPMFrom(ctx, Registry(), text, keep)
+}
+
+func searchNPMFrom(ctx context.Context, reg RegistryInUse, text string, keep func(string, []string) bool) ([]Hit, error) {
 	v := url.Values{"text": {text}, "size": {"30"}}
-	b, err := fetchNPM(ctx, "", "/-/v1/search?"+v.Encode(), 4<<20)
-	if _, _, official := npmBase(""); err != nil && !official {
-		// a registry of the user's that has no search (a private one):
-		// npm's own has the plugins' packages
-		b, err = fetchJSON(ctx, npmRegistry+"/-/v1/search?"+v.Encode(), 4<<20)
+	path := "/-/v1/search?" + v.Encode()
+	b, err := fetchNPMFrom(ctx, reg, "", path, 4<<20)
+	if err != nil && reg.upstream() == "" && reg.From != FromDefault && reg.From != FromChina {
+		// Automatic mode can use the public search when the inherited
+		// registry doesn't implement it. An explicit upstream cannot.
+		b, err = fetchJSON(ctx, npmRegistry+path, 4<<20)
 	}
 	if err != nil {
 		return nil, err
@@ -652,7 +665,7 @@ func searchNPM(ctx context.Context, text string, keep func(string, []string) boo
 		return nil, err
 	}
 	if plain := PlainKeywords(text); len(r.Objects) == 0 && plain != text {
-		return searchNPM(ctx, plain, keep)
+		return searchNPMFrom(ctx, reg, plain, keep)
 	}
 	var out []Hit
 	for _, o := range r.Objects {
@@ -737,7 +750,8 @@ func ReadmeIn(ctx context.Context, name, lang string) (Page, error) {
 	if r, ok := cachedReadme(ctx, name); ok {
 		return Page{Readme: r}, nil
 	}
-	b, err := fetchNPM(ctx, name, "/"+npmPath(name), 32<<20)
+	r := Registry()
+	b, err := fetchNPMFrom(ctx, r, name, "/"+npmPath(name), 32<<20)
 	if err != nil {
 		// one npm doesn't have (yet): the README the community repo's
 		// dist branch packed with it
@@ -766,7 +780,7 @@ func ReadmeIn(ctx context.Context, name, lang string) (Page, error) {
 	// the registry's entry holds the README.md alone; one named for the
 	// reader's language is in the package's files, which only the public
 	// registry's copy is asked of jsDelivr for
-	if _, _, official := npmBase(name); official {
+	if _, _, official := npmBase(r, name); official {
 		if r, ok := npmLangReadme(ctx, name, d.DistTags["latest"], lang); ok {
 			d.Readme = r
 		}
@@ -915,6 +929,7 @@ func ownSummary(raw json.RawMessage) map[string]string {
 // Upgrade installs the newest version of one plugin: npm's, or its git
 // repository's commit now. One bun won't install says why.
 func Upgrade(ctx context.Context, name string) error {
+	ctx = withRegistry(ctx, Registry())
 	for _, e := range Load().Plugins {
 		if (Name(e.Spec) == name || e.Spec == name) && IsGit(e.Spec) {
 			err := reinstall(ctx, e.Spec)

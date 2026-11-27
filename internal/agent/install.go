@@ -238,7 +238,8 @@ func npmGlobalPrefix() string {
 	return npmPrefixes.get(npm, "", time.Hour, 5*time.Minute, func() (string, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		cmd := proc.CommandContext(ctx, npm, "prefix", "-g")
+		// Reading a local path must not start npm's own registry update check.
+		cmd := proc.CommandContext(ctx, npm, "--no-update-notifier", "prefix", "-g")
 		cmd.Stdin = nil
 		out, err := cmd.Output()
 		if err != nil {

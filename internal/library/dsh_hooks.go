@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/agent"
+	"github.com/yetone/magpie/internal/npmregistry"
 	"github.com/yetone/magpie/internal/proc"
 )
 
@@ -80,15 +81,15 @@ func dshInstalled(profile, pkg string) string {
 var dshTool = func(a *agent.Agent) (string, string) { return a.InstalledVersion(), a.BinPath() }
 
 // dshPluginRun runs `dsh <args>` in cwd, a profile's folder, under
-// DSH_HOME dir; a var for tests.
-var dshPluginRun = func(bin, dir, cwd string, args ...string) (string, error) {
+// DSH_HOME dir, with the registry selected for this sync; a var for tests.
+var dshPluginRun = func(bin, dir, cwd, registry string, args ...string) (string, error) {
 	const timeout = 3 * time.Minute
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := proc.CommandContext(ctx, bin, args...)
 	cmd.Stdin = nil
 	cmd.Dir = cwd
-	cmd.Env = append(os.Environ(), "DSH_HOME="+dir, "PATH="+filepath.Dir(bin)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	cmd.Env = npmregistry.WithEnv(append(os.Environ(), "DSH_HOME="+dir, "PATH="+filepath.Dir(bin)+string(os.PathListSeparator)+os.Getenv("PATH")), registry)
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if err != nil {
@@ -103,9 +104,9 @@ var dshPluginRun = func(bin, dir, cwd string, args ...string) (string, error) {
 	return text, nil
 }
 
-// dshInstallFailed remembers an install that failed, per profile and
-// version, so a sync that runs every few seconds doesn't wait on the
-// network again each time.
+// dshInstallFailed remembers an install that failed, per profile, version
+// and upstream, so a sync doesn't retry it each time or carry the delay
+// over to a newly selected upstream.
 var (
 	dshInstallMu     sync.Mutex
 	dshInstallFailed = map[string]time.Time{}
@@ -119,12 +120,13 @@ const dshInstallRetry = 10 * time.Minute
 // in the error, the others done.
 func dshHooksPlugin(t *Target, file string, want bool, keep func(path string) error) error {
 	dir := t.Agent.Dir
-	var ver, bin string
+	var ver, bin, registry string
 	if want {
 		ver, bin = dshTool(t.Agent)
 		if ver == "" || bin == "" {
 			return errors.New("DeepSeek Harness's version or command isn't known, so its hooks plugin can't be installed")
 		}
+		registry = npmregistry.Configured()
 	}
 	var errs []error
 	for _, patch := range agent.DshPatchFiles(dir) {
@@ -140,7 +142,7 @@ func dshHooksPlugin(t *Target, file string, want bool, keep func(path string) er
 			continue
 		}
 		if dshInstalled(profile, dshHooksPkg) != ver || dshInstalled(profile, dshHooksProtocol) != ver {
-			key := profile + "\x00" + ver
+			key := profile + "\x00" + ver + "\x00" + registry
 			dshInstallMu.Lock()
 			at, failed := dshInstallFailed[key]
 			dshInstallMu.Unlock()
@@ -152,7 +154,7 @@ func dshHooksPlugin(t *Target, file string, want bool, keep func(path string) er
 				}
 				continue
 			}
-			_, err := dshPluginRun(bin, dir, profile, "plugin", "--profile", name, "add", dshHooksProtocol+"@"+ver, dshHooksPkg+"@"+ver)
+			_, err := dshPluginRun(bin, dir, profile, registry, "plugin", "--profile", name, "add", dshHooksProtocol+"@"+ver, dshHooksPkg+"@"+ver)
 			if err == nil && (dshInstalled(profile, dshHooksPkg) != ver || dshInstalled(profile, dshHooksProtocol) != ver) {
 				err = fmt.Errorf("%s isn't installed after its install", dshHooksPkg)
 			}

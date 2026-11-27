@@ -41,7 +41,7 @@ func TestTaggedAgentWithMain(t *testing.T) {
 	t.Cleanup(func() { githubAPI, githubRaw, npmRegistry = api, raw, reg })
 
 	const repo = "miaocell/magpie-agent-deva"
-	got, keep, known, err := readTagged(context.Background(), Tagged{Spec: "github:" + repo, Repo: repo}, "main")
+	got, keep, known, err := readTagged(context.Background(), Registry(), Tagged{Spec: "github:" + repo, Repo: repo}, "main")
 	if !keep || !known || err != nil || got.Kind != "agent" || got.Package != "magpie-agent-deva" || got.Spec != "github:"+repo {
 		t.Fatalf("an agent with a main: kind %q, package %q, spec %q, kept %v, known %v, %v", got.Kind, got.Package, got.Spec, keep, known, err)
 	}
@@ -54,7 +54,7 @@ func TestTaggedAgentWithMain(t *testing.T) {
 
 	// an agent alone, no main, as before: its agent file is the one
 	// looked for
-	got, keep, _, err = readTagged(context.Background(), Tagged{Spec: "github:someone/agent-aider", Repo: "someone/agent-aider"}, "main")
+	got, keep, _, err = readTagged(context.Background(), Registry(), Tagged{Spec: "github:someone/agent-aider", Repo: "someone/agent-aider"}, "main")
 	if !keep || err != nil || got.Kind != "agent" {
 		t.Fatalf("an agent alone: %+v, kept %v, %v", got, keep, err)
 	}

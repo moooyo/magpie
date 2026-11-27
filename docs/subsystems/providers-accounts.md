@@ -539,6 +539,8 @@ the price is the own id's first (`ListPrice`). `TestModelIDListedAndAskedForByOw
 
 ## Constraints and failure behavior
 
+The Codex provider's published-version check uses the [explicit npm upstream](provider-plugins.md#the-npm-upstream) when set. Its background lookup is still independent of the Agent CLI update check, and keeps a recent answer only for the upstream that provided it.
+
 An allowance deliberately not requested (a saved Claude account outside
 its card refresh, or allowances set to *When I ask*) can use the last
 reading with `readDeferred: true`. `AsOf` and `ReadAt` still date that

@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"reflect"
 	"slices"
 	"strconv"
@@ -16,6 +17,9 @@ import (
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/library"
+	"github.com/yetone/magpie/internal/npmregistry"
+	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -37,7 +41,7 @@ var Keys = []string{
 	// usage and alerts
 	"currency", "totalCurrency", "trayCurrency", "chineseUnits", "inUncached", "dayStart", "timeZone", "usageAlert", "balanceAlert", "resetReminder", "turnDoneAlert", "maskAlert",
 	// network
-	"proxy", "pluginProxy", "updateProxy", "updateSource",
+	"proxy", "pluginProxy", "updateProxy", "updateSource", "npmRegistry",
 	// privacy
 	"redact", "redactPersonal", "redactKinds", "redactWords", "redactWordsAnyCase", "redactWordsWhole", "redactShape",
 	"hideRequestText", "noStats", "noUsageStats", "otel",
@@ -128,6 +132,11 @@ func Body(cur settings.Settings, key string, value json.RawMessage) ([]byte, err
 	if err := json.Unmarshal(b, &m); err != nil {
 		return nil, err
 	}
+	// The registry is edited on its own, including from the plugin command.
+	// Like an unrelated page save, a different key leaves it untouched.
+	if key != "npmRegistry" {
+		delete(m, "npmRegistry")
+	}
 	m[key] = value
 	return json.Marshal(m)
 }
@@ -148,7 +157,11 @@ func Apply(body []byte, web bool) (in, cur settings.Settings, err error) {
 	if err != nil {
 		return in, cur, err
 	}
-	if err := settings.Save(in); err != nil {
+	var fields map[string]json.RawMessage
+	_ = json.NewDecoder(bytes.NewReader(body)).Decode(&fields) // Merge validated the value
+	_, sent := fields["npmRegistry"]
+	before, err := settings.SavePrefs(&in, sent)
+	if err != nil {
 		return in, cur, err
 	}
 	// whether agents are told every model takes images follows Vision
@@ -156,7 +169,44 @@ func Apply(body []byte, web bool) (in, cur settings.Settings, err error) {
 	if strings.TrimSpace(in.Vision) != strings.TrimSpace(cur.Vision) {
 		catalog.Touched()
 	}
+	syncRegistryMCP(before, in.NPMRegistry)
 	return in, cur, nil
+}
+
+// SetPluginRegistry is the Plugins editor and command's existing selector.
+// It writes the same setting as Apply, while returning Plugins' effective URL.
+func SetPluginRegistry(u string) (plugin.RegistryInUse, error) {
+	before := npmregistry.Configured()
+	r, err := plugin.SetRegistry(u)
+	if err == nil {
+		after := ""
+		if r.From == plugin.FromMagpie {
+			after = r.URL
+		}
+		syncRegistryMCP(before, after)
+	}
+	return r, err
+}
+
+// syncRegistryMCP refreshes magpie-managed MCP entries only on a real
+// upstream change. A failed sync doesn't undo or fail the saved setting.
+func syncRegistryMCP(before, after string) {
+	if before == after {
+		return
+	}
+	old, _ := npmregistry.Clean(before)
+	want, _ := npmregistry.Clean(after)
+	if old == want {
+		return
+	}
+	res, err := library.SyncMCP()
+	if err != nil {
+		log.Printf("npm registry was saved, but MCP sync failed: %v", err)
+		return
+	}
+	for _, p := range res.Problems {
+		log.Printf("npm registry was saved, but MCP sync failed: %s %s: %s", p.Agent, p.What, p.Error)
+	}
 }
 
 // Merge is the settings body sets over cur: the page's own choices from
@@ -191,6 +241,16 @@ func Merge(body []byte, cur settings.Settings, web bool) (settings.Settings, err
 	// nor the longest wait an agent is told (#5371)
 	if _, sent := fields["retryAfterCap"]; !sent {
 		in.RetryAfterCap = cur.RetryAfterCap
+	}
+	// The npm registry has more than one editor. A save from another row
+	// doesn't clear it or try to validate a value someone put in the file.
+	if _, sent := fields["npmRegistry"]; sent {
+		var err error
+		if in.NPMRegistry, err = npmregistry.Clean(in.NPMRegistry); err != nil {
+			return in, err
+		}
+	} else {
+		in.NPMRegistry = cur.NPMRegistry
 	}
 	// nor whether updates download by themselves (#2296)
 	if _, sent := fields["noAutoDownload"]; !sent {
@@ -439,7 +499,6 @@ func Merge(body []byte, cur settings.Settings, web bool) (settings.Settings, err
 	in.RedactRouteTo = cur.RedactRouteTo
 	in.DesktopSubagentEffort = cur.DesktopSubagentEffort
 	in.ChinaMirror = cur.ChinaMirror // the Plugins page's, set on its own
-	in.NPMRegistry = cur.NPMRegistry // and its npm registry
 	// which Codex accounts spend a reset by themselves, set on the Usage card
 	in.CodexAutoReset = cur.CodexAutoReset
 	in.CodexAutoResetOnly = cur.CodexAutoResetOnly // and at which of the two times

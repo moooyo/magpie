@@ -8,10 +8,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/testenv"
 )
 
@@ -178,11 +180,11 @@ func TestCodexVersionPublished(t *testing.T) {
 	if v, ua := req.Header.Get("version"), req.Header.Get("User-Agent"); v != codexClientVersion || !strings.Contains(ua, "/"+codexClientVersion+" (") {
 		t.Fatalf("an old Codex's request went as version %q, User-Agent %q", v, ua)
 	}
-	var answer string
+	var answer atomic.Value
 	var asks atomic.Int32
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		asks.Add(1)
-		w.Write([]byte(answer))
+		w.Write([]byte(answer.Load().(string)))
 	}))
 	defer fake.Close()
 	codexNpmLatest = fake.URL + "/@openai/codex/latest"
@@ -193,28 +195,122 @@ func TestCodexVersionPublished(t *testing.T) {
 		{`<html>`, codexClientVersion},
 	} {
 		reset()
-		answer = c.answer
+		answer.Store(c.answer)
 		asks.Store(0)
 		codexVersion() // asks in the background
-		deadline := time.Now().Add(10 * time.Second)
-		for {
-			codexPublishedCache.Lock()
-			done := !codexPublishedCache.at.IsZero() && !codexPublishedCache.asking
-			codexPublishedCache.Unlock()
-			if done {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("%s: npm's answer was never read", c.answer)
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
+		waitCodexPublishedAsk(t, codexPublishedAskForTest())
 		if got := codexVersion(); got != c.want {
 			t.Errorf("npm said %s: %s, want %s", c.answer, got, c.want)
 		}
 		if n := asks.Load(); n != 1 {
 			t.Errorf("npm said %s: asked %d times", c.answer, n)
 		}
+	}
+}
+
+func codexPublishedAskForTest() <-chan struct{} {
+	codexPublishedCache.Lock()
+	defer codexPublishedCache.Unlock()
+	return codexPublishedCache.asking
+}
+
+func waitCodexPublishedAsk(t *testing.T, ask <-chan struct{}) {
+	t.Helper()
+	if ask == nil {
+		return
+	}
+	select {
+	case <-ask:
+	case <-time.After(10 * time.Second):
+		t.Fatal("npm's answer was never read")
+	}
+}
+
+func TestCodexPublishedRegistryChanges(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	started, held := make(chan struct{}), make(chan struct{})
+	release := sync.OnceFunc(func() { close(held) })
+	var first, down, defaultAsks atomic.Int32
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/first/@openai/codex/latest":
+			if first.Add(1) == 1 {
+				close(started)
+				select {
+				case <-held:
+				case <-r.Context().Done():
+					return
+				}
+				w.Write([]byte(`{"version":"9.9.0"}`))
+				return
+			}
+			w.Write([]byte(`{"version":"9.1.0"}`))
+		case "/down/@openai/codex/latest":
+			down.Add(1)
+			http.Error(w, "unavailable", http.StatusBadGateway)
+		case "/@openai/codex/latest":
+			defaultAsks.Add(1)
+			w.Write([]byte(`{"version":"9.2.0"}`))
+		default:
+			t.Errorf("unexpected npm path %q", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(fake.Close)
+	old, oldURL := codexExecutable, codexNpmLatest
+	codexExecutable, codexNpmLatest = func() string { return "" }, fake.URL+"/@openai/codex/latest"
+	ForgetCodexClientsForTest()
+	var asks []<-chan struct{}
+	t.Cleanup(func() {
+		release()
+		for _, ask := range asks {
+			waitCodexPublishedAsk(t, ask)
+		}
+		codexExecutable, codexNpmLatest = old, oldURL
+		ForgetCodexClientsForTest()
+		codexPublishedCache.Lock()
+		codexPublishedCache.source = codexPublishedSource{}
+		codexPublishedCache.v, codexPublishedCache.at = "", time.Time{}
+		codexPublishedCache.Unlock()
+	})
+	selectRegistry := func(registry string) <-chan struct{} {
+		t.Helper()
+		s := settings.Load()
+		s.NPMRegistry = registry
+		if err := settings.Save(s); err != nil {
+			t.Fatal(err)
+		}
+		v := codexVersion()
+		ask := codexPublishedAskForTest()
+		asks = append(asks, ask)
+		if v != codexClientVersion {
+			t.Fatalf("after selecting %q, got a version from the previous registry: %s", registry, v)
+		}
+		return ask
+	}
+	stale := selectRegistry(fake.URL + "/first")
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no request to the first registry")
+	}
+	waitCodexPublishedAsk(t, selectRegistry(fake.URL+"/down"))
+	if got := codexVersion(); got != codexClientVersion || down.Load() != 1 || defaultAsks.Load() != 0 {
+		t.Fatalf("unavailable registry: %s, configured/default requests %d/%d", got, down.Load(), defaultAsks.Load())
+	}
+	waitCodexPublishedAsk(t, selectRegistry(fake.URL+"/first"))
+	release()
+	waitCodexPublishedAsk(t, stale)
+	if got := codexVersion(); got != "9.1.0" || first.Load() != 2 || defaultAsks.Load() != 0 {
+		t.Fatalf("switch back: %s, first/default requests %d/%d", got, first.Load(), defaultAsks.Load())
+	}
+	waitCodexPublishedAsk(t, selectRegistry(""))
+	if got := codexVersion(); got != "9.2.0" || defaultAsks.Load() != 1 {
+		t.Fatalf("registry cleared: %s, default requests %d", got, defaultAsks.Load())
 	}
 }
 

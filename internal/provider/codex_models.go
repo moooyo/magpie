@@ -20,9 +20,9 @@ import (
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/codexcat"
 	"github.com/yetone/magpie/internal/lazyre"
+	"github.com/yetone/magpie/internal/npmregistry"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/settings"
-	"github.com/yetone/magpie/internal/source"
 )
 
 // codexClientVersion is the oldest Codex CLI version the models list is
@@ -155,7 +155,6 @@ var codexVersionCache struct {
 // (0.155 GPT-6 Luna and Sol), asking with it would leave them out.
 func codexVersion() string {
 	codexVersionCache.Lock()
-	defer codexVersionCache.Unlock()
 	if time.Since(codexVersionCache.at) >= 10*time.Minute {
 		v := codexClientVersion
 		newer := func(c string) {
@@ -176,7 +175,9 @@ func codexVersion() string {
 		}
 		codexVersionCache.v, codexVersionCache.at = v, time.Now()
 	}
-	return newerVersion(newerVersion(codexVersionCache.v, codexSeen.get()), codexPublished())
+	v := codexVersionCache.v
+	codexVersionCache.Unlock()
+	return newerVersion(newerVersion(v, codexSeen.get()), codexPublished())
 }
 
 // codexNpmLatest is where npm says which @openai/codex is latest, the
@@ -184,55 +185,68 @@ func codexVersion() string {
 // can serve one.
 var codexNpmLatest = codexNpmRegistry
 
-const codexNpmRegistry = "https://registry.npmjs.org/@openai/codex/latest"
+const codexNpmPackage = "@openai/codex"
+const codexNpmRegistry = npmregistry.Default + "/" + codexNpmPackage + "/latest"
 
-// codexPublishedEvery is how often npm is asked again.
+// codexPublishedEvery is how often the same upstream is asked again.
 const codexPublishedEvery = 6 * time.Hour
+
+type codexPublishedSource struct{ url, registry string }
 
 var codexPublishedCache struct {
 	sync.Mutex
-	v      string    // the latest read, "" before one is
-	at     time.Time // when it was last asked
-	asking bool
+	source codexPublishedSource
+	v      string        // the latest read, "" before one is
+	at     time.Time     // when it was last asked
+	asking chan struct{} // identity and completion of the current request
 }
 
-// codexPublished is npm's latest Codex CLI as last read, "" before it is:
-// asked in the background at most every codexPublishedEvery, through the
-// mirrors when npm doesn't answer, and never from a test binary unless a
-// test points codexNpmLatest at a fake.
+// codexPublished is the latest Codex CLI as last read from the configured
+// upstream, "" before it is. The lookup runs in the background; tests
+// only start it when they point codexNpmLatest at a fake.
 func codexPublished() string {
+	src := codexPublishedSource{codexNpmLatest, npmregistry.Configured()}
 	codexPublishedCache.Lock()
-	defer codexPublishedCache.Unlock()
-	v, u := codexPublishedCache.v, codexNpmLatest
-	if codexPublishedCache.asking || time.Since(codexPublishedCache.at) < codexPublishedEvery || testing.Testing() && u == codexNpmRegistry {
+	if codexPublishedCache.source != src {
+		codexPublishedCache.source = src
+		codexPublishedCache.v, codexPublishedCache.at, codexPublishedCache.asking = "", time.Time{}, nil
+	}
+	v := codexPublishedCache.v
+	if codexPublishedCache.asking != nil || time.Since(codexPublishedCache.at) < codexPublishedEvery || testing.Testing() && src.url == codexNpmRegistry {
+		codexPublishedCache.Unlock()
 		return v
 	}
-	codexPublishedCache.asking = true
+	ask := make(chan struct{})
+	codexPublishedCache.asking = ask
+	codexPublishedCache.Unlock()
 	go func() {
-		found := codexAskPublished(u)
+		found := codexAskPublished(src)
 		codexPublishedCache.Lock()
-		if found != "" {
-			codexPublishedCache.v = found
+		// An old request can finish even after switching away and back.
+		if codexPublishedCache.asking == ask {
+			if found != "" {
+				codexPublishedCache.v = found
+			}
+			codexPublishedCache.at, codexPublishedCache.asking = time.Now(), nil
 		}
-		codexPublishedCache.at, codexPublishedCache.asking = time.Now(), false
 		codexPublishedCache.Unlock()
+		close(ask)
 	}()
 	return v
 }
 
 var codexReleaseRe = lazyre.New(`^\d{1,4}\.\d{1,4}\.\d{1,6}$`)
 
-// codexAskPublished is the version u says is latest, or "" when it can't
-// be read or isn't a release version (an alpha is never named: the
-// backend's lists and requests are a release's).
-func codexAskPublished(u string) string {
+// codexAskPublished reads a release version from src. A failed lookup or
+// a prerelease yields no version to advertise to the backend.
+func codexAskPublished(src codexPublishedSource) string {
 	c := &http.Client{Timeout: 8 * time.Second, Transport: http.DefaultClient.Transport}
-	req, err := http.NewRequest(http.MethodGet, u, nil)
+	req, err := http.NewRequest(http.MethodGet, src.url, nil)
 	if err != nil {
 		return ""
 	}
 	req.Header.Set("Accept", "application/json")
-	res, err := source.Do(c, req)
+	res, err := npmregistry.Do(c, req, src.registry, codexNpmPackage)
 	if err != nil {
 		return ""
 	}

@@ -5,10 +5,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/yetone/magpie/internal/proc"
 )
 
 // An agent installed inside a WSL distro has its version read and is
@@ -107,5 +111,64 @@ func TestWSLAgentCLIVersionAndUpdate(t *testing.T) {
 	}
 	if asked["Stopped"] != before {
 		t.Fatalf("a stopped distro was asked %d times", asked["Stopped"]-before)
+	}
+}
+
+func TestWSLCLIUpdateRegistryArgs(t *testing.T) {
+	var got []string
+	old := wslRun
+	t.Cleanup(func() { wslRun = old })
+	wslRun = func(_ time.Duration, args ...string) ([]byte, error) {
+		got = slices.Clone(args)
+		return nil, nil
+	}
+	const registry = "https://mirror.example/repo;$HOME&next"
+	for _, c := range []struct {
+		via, name, registry string
+		configured          bool
+	}{
+		{"npm", "/home/me/bin/npm", registry, true},
+		{"bun", "bun", registry, true},
+		{"pnpm", "pnpm", registry, true},
+		{"brew", "brew", registry, false},
+		{"npm", "npm", "", false},
+	} {
+		u := &updater{via: c.via, wsl: "Ubuntu", registry: c.registry, cmd: []string{c.name, "update", "cline@latest"}}
+		if _, err := wslRunUpdate(time.Second, u); err != nil {
+			t.Fatal(err)
+		}
+		if len(got) < 8+len(u.cmd) || strings.Contains(got[5], registry) || !slices.Equal(got[len(got)-len(u.cmd):], u.cmd) {
+			t.Fatalf("%s's updater did not pass the command as arguments: %q", c.via, got)
+		}
+		args := got[8 : len(got)-len(u.cmd)]
+		if c.configured {
+			clear := []string{"-u", "npm_config_registry", "-u", "NPM_CONFIG_REGISTRY"}
+			if len(args) < len(clear) || !slices.Equal(args[:len(clear)], clear) {
+				t.Fatalf("%s did not clear npm's registry aliases: %q", c.via, args)
+			}
+			wantCLIRegistryVar(t, args[len(clear):], "NPM_CONFIG_REGISTRY", registry+"/")
+			wantCLIRegistryVar(t, args[len(clear):], "BUN_CONFIG_REGISTRY", registry+"/")
+		} else {
+			for _, arg := range args {
+				if strings.Contains(strings.ToLower(arg), "registry") {
+					t.Errorf("%s with registry %q modified it: %q", c.via, c.registry, args)
+				}
+			}
+		}
+	}
+}
+
+func TestWSLCLIProbeDisablesClineAutoUpdate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the distro's sh script runs on Unix")
+	}
+	t.Setenv("CLINE_NO_AUTO_UPDATE", "0")
+	cline := file(t, filepath.Join(t.TempDir(), "cline"), `#!/bin/sh
+[ "$1" = --version ] && [ "$CLINE_NO_AUTO_UPDATE" = 1 ] || exit 1
+printf 'Cline 1.2.3\n'
+`)
+	out, err := proc.CommandContext(t.Context(), "/bin/sh", "-c", wslCLIScript, "sh", cline).Output()
+	if err != nil || !strings.Contains(string(out), "code:0\nver:Cline 1.2.3") {
+		t.Fatalf("version probe: %q, %v", out, err)
 	}
 }
