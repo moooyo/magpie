@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -19,15 +21,16 @@ import (
 
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/lazyre"
+	"github.com/yetone/magpie/internal/npmregistry"
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/proc"
 )
 
 // Pi's package market (nineruiing on X). Pi's gallery, pi.dev/packages, is
 // npm's packages with the keyword "pi-package", drawn on its server with no
-// API of its own; magpie reads the same list from npm's search, kept as
-// the skills market keeps skills.sh's: six hours in memory, on disk for
-// when npm can't be reached, else the snapshot magpie shipped with.
+// API of its own; magpie reads the list from npm's search and keeps it
+// for six hours. Automatic mode can use its disk cache offline; a
+// configured upstream never uses that cache or tries another registry.
 //
 // A package is installed and removed by Pi's own `pi install npm:<name>`
 // and `pi remove`, run with PI_CODING_AGENT_DIR set to that Pi's agent
@@ -72,12 +75,13 @@ type piListed struct {
 	Date        string `json:"date,omitempty"`
 }
 
-// piNPMURL is npm's own search, asked when the registry in use (the
-// user's own, or npmmirror with the 「国内镜像」 switch) can't search;
-// piRegistry is that registry. Variables for tests.
+const piSearchPath = "/-/v1/search"
+
+// In automatic mode Pi tries the effective registry, then npm's own if
+// it can't answer. Variables for tests.
 var (
-	piNPMURL   = "https://registry.npmjs.org/-/v1/search"
-	piRegistry = func() string { return plugin.Registry().URL }
+	piNPMBase  = npmregistry.Default
+	piRegistry = plugin.Registry
 )
 
 //go:embed market_pi.json
@@ -85,44 +89,70 @@ var piSnapshot []byte
 
 var piPopular = struct {
 	sync.Mutex
-	list []piListed
-	at   time.Time
+	upstream string // empty in automatic mode, the configured URL otherwise
+	list     []piListed
+	err      error
+	until    time.Time
 }{}
 
 // popularPi is the most downloaded of the first 500 packages npm lists by
-// the keyword: Pi's gallery's own source.
-func popularPi() []piListed {
+// the keyword: Pi's gallery's own source. The disk cache is only for
+// automatic mode; a configured source keeps its own results in memory.
+func popularPi(registry plugin.RegistryInUse) ([]piListed, error) {
+	upstream := ""
+	if registry.From == plugin.FromMagpie {
+		upstream = registry.URL
+	}
 	piPopular.Lock()
 	defer piPopular.Unlock()
-	if piPopular.list != nil && time.Since(piPopular.at) < 6*time.Hour {
-		return piPopular.list
+	same := piPopular.upstream == upstream
+	if same && time.Now().Before(piPopular.until) {
+		return piPopular.list, piPopular.err
 	}
-	cache := marketCache("pi-packages.json")
-	if list, err := fetchPiPopular(); err == nil && len(list) > 0 {
-		piPopular.list, piPopular.at = list, time.Now()
-		if b, err := json.Marshal(list); err == nil && cache != "" {
-			_ = os.MkdirAll(filepath.Dir(cache), 0o755)
-			_ = os.WriteFile(cache, b, 0o644)
+	list, err := fetchPiPopular(registry)
+	ttl := 6 * time.Hour
+	if upstream == "" {
+		cache := marketCache("pi-packages.json")
+		if err == nil && len(list) > 0 {
+			if b, marshalErr := json.Marshal(list); marshalErr == nil && cache != "" {
+				_ = os.MkdirAll(filepath.Dir(cache), 0o755)
+				_ = os.WriteFile(cache, b, 0o644)
+			}
+		} else {
+			if b, readErr := os.ReadFile(cache); readErr != nil || json.Unmarshal(b, &list) != nil || len(list) == 0 {
+				list = builtinPi()
+			}
+			ttl, err = 5*time.Minute, nil
 		}
-		return list
+	} else if err != nil {
+		if list == nil && same {
+			list = piPopular.list
+		}
+		ttl = 5 * time.Minute
 	}
-	var list []piListed
-	if b, err := os.ReadFile(cache); err != nil || json.Unmarshal(b, &list) != nil || len(list) == 0 {
-		_ = json.Unmarshal(piSnapshot, &list)
-	}
-	piPopular.list, piPopular.at = list, time.Now().Add(-6*time.Hour+5*time.Minute) // try again in a while
-	return list
+	piPopular.upstream, piPopular.list, piPopular.err, piPopular.until = upstream, list, err, time.Now().Add(ttl)
+	return list, err
 }
 
-func fetchPiPopular() ([]piListed, error) {
+var builtinPi = sync.OnceValue(func() []piListed {
 	var list []piListed
+	_ = json.Unmarshal(piSnapshot, &list)
+	return list
+})
+
+func fetchPiPopular(registry plugin.RegistryInUse) ([]piListed, error) {
+	var err error
+	list := []piListed{}
 	for from := 0; from < 500; from += 250 {
-		page, total, err := searchPiNPM("", 250, from)
-		if err != nil {
-			if len(list) > 0 {
-				break
+		page, total, pageErr := searchPiNPM(registry, "", 250, from)
+		if pageErr != nil {
+			if len(list) == 0 {
+				return nil, pageErr
 			}
-			return nil, err
+			if registry.From == plugin.FromMagpie {
+				err = pageErr
+			}
+			break
 		}
 		list = append(list, page...)
 		if from+250 >= total {
@@ -130,17 +160,56 @@ func fetchPiPopular() ([]piListed, error) {
 		}
 	}
 	slices.SortStableFunc(list, func(a, b piListed) int { return cmp.Compare(b.Downloads, a.Downloads) })
-	return piOnce(list), nil
+	return piOnce(list), err
+}
+
+// piRegistryJSON asks the selected registry. Only automatic mode tries
+// npm's public registry as a fallback when the other source fails.
+func piRegistryJSON[T any](registry plugin.RegistryInUse, name, path string) (T, error) {
+	var doc T
+	if registry.From != plugin.FromMagpie {
+		if r := strings.TrimRight(registry.URL, "/"); r != "" && r != piNPMBase {
+			var mirror T
+			if err := getJSON(r+path, &mirror); err == nil {
+				return mirror, nil
+			}
+		}
+		err := getJSON(piNPMBase+path, &doc)
+		return doc, err
+	}
+	req, err := http.NewRequest(http.MethodGet, piNPMBase+path, nil)
+	if err != nil {
+		return doc, err
+	}
+	req.Header.Set("Accept", "application/json")
+	res, err := npmregistry.Do(client, req, registry.URL, name)
+	if err != nil {
+		return doc, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return doc, fmt.Errorf("%s answered %s", res.Request.URL.Host, res.Status)
+	}
+	const limit = 8 << 20
+	b, err := io.ReadAll(io.LimitReader(res.Body, limit+1))
+	if err != nil {
+		return doc, err
+	}
+	if len(b) > limit {
+		return doc, fmt.Errorf("%s's npm registry response is too large", res.Request.URL.Host)
+	}
+	err = json.Unmarshal(b, &doc)
+	return doc, err
 }
 
 // searchPiNPM is one page of npm's search for packages with the keyword,
 // and how many there are.
-func searchPiNPM(q string, size, from int) ([]piListed, int, error) {
+func searchPiNPM(registry plugin.RegistryInUse, q string, size, from int) ([]piListed, int, error) {
 	text := "keywords:pi-package"
 	if q = strings.TrimSpace(q); q != "" {
 		text += " " + q
 	}
-	var body struct {
+	type searchBody struct {
 		Total   int `json:"total"`
 		Objects []struct {
 			Downloads struct {
@@ -162,18 +231,17 @@ func searchPiNPM(q string, size, from int) ([]piListed, int, error) {
 			} `json:"package"`
 		} `json:"objects"`
 	}
+	var body searchBody
 	ask := func(text string) error {
-		body.Total, body.Objects = 0, nil
-		query := "?" + url.Values{"text": {text}, "size": {strconv.Itoa(size)}, "from": {strconv.Itoa(from)}}.Encode()
-		err := errors.New("no registry")
-		if r := strings.TrimRight(piRegistry(), "/"); r != "" && r != strings.TrimSuffix(piNPMURL, "/-/v1/search") {
-			err = getJSON(r+"/-/v1/search"+query, &body)
+		query := url.Values{"text": {text}, "size": {strconv.Itoa(size)}, "from": {strconv.Itoa(from)}}.Encode()
+		doc, err := piRegistryJSON[searchBody](registry, "", piSearchPath+"?"+query)
+		if err == nil && registry.From == plugin.FromMagpie && doc.Objects == nil {
+			err = errors.New("npm registry search response has no objects array")
 		}
 		if err != nil {
-			if err = getJSON(piNPMURL+query, &body); err != nil {
-				return &SearchError{Source: "npm", Err: err}
-			}
+			return &SearchError{Source: "npm", Err: err}
 		}
+		body = doc
 		return nil
 	}
 	if err := ask(text); err != nil {
@@ -184,10 +252,8 @@ func searchPiNPM(q string, size, from int) ([]piListed, int, error) {
 	// eachg0 on X, "rename" found no pi-rename). The list before a search
 	// stays the one magpie shipped with there: npmmirror's has no monthly
 	// downloads to put the most used first.
-	if q != "" && len(body.Objects) == 0 && from == 0 {
-		if ask(plugin.PlainKeywords(text)) != nil {
-			body.Total, body.Objects = 0, nil // the first answer stands
-		}
+	if (q != "" || registry.From == plugin.FromMagpie) && len(body.Objects) == 0 && from == 0 {
+		_ = ask(plugin.PlainKeywords(text)) // on error the first answer stands
 	}
 	var out []piListed
 	for _, o := range body.Objects {
@@ -220,18 +286,33 @@ func piOnce(list []piListed) []piListed {
 
 // MarketPiPackages is what the market shows for a search: the popular
 // packages that match it, then what npm finds for it.
-func MarketPiPackages(q string) ([]PiMarketPackage, error) {
-	q = strings.ToLower(strings.TrimSpace(q))
+func MarketPiPackages(query string) ([]PiMarketPackage, error) {
+	q := strings.ToLower(strings.TrimSpace(query))
+	registry := piRegistry()
+	popular, err := popularPi(registry)
+	var found []piListed
+	if len([]rune(q)) >= 2 {
+		found, _, err = searchPiNPM(registry, q, 100, 0)
+	}
+	// Use the shipped list only when the configured source couldn't answer.
+	// Don't let it mask an exact lookup (PiDirectAt) for a named package.
+	if registry.From == plugin.FromMagpie && popular == nil && err != nil {
+		src, bare := piSourceFor(query)
+		if src == "" || bare || piKind(src) != "npm" {
+			popular = builtinPi()
+			if bare && src != "" {
+				name, _ := piPackageName(src)
+				popular = slices.DeleteFunc(slices.Clone(popular), func(p piListed) bool { return p.Name == name })
+			}
+		}
+	}
 	var list []piListed
-	for _, p := range popularPi() {
+	for _, p := range popular {
 		if q == "" || strings.Contains(strings.ToLower(p.Name+" "+p.Publisher+" "+p.Description), q) {
 			list = append(list, p)
 		}
 	}
-	var err error
-	if len([]rune(q)) >= 2 {
-		var found []piListed
-		found, _, err = searchPiNPM(q, 100, 0)
+	if len(found) > 0 {
 		list = piOnce(append(list, found...))
 	}
 	out := []PiMarketPackage{}
@@ -304,7 +385,7 @@ var piRun = func(bin, dir string, args ...string) (string, error) {
 	cmd.Stdin = nil
 	cmd.Dir = dir
 	// pi is a node script: its folder first, so its node is found
-	cmd.Env = append(os.Environ(), "PI_CODING_AGENT_DIR="+dir, "PATH="+filepath.Dir(bin)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	cmd.Env = npmregistry.Env(append(os.Environ(), "PI_CODING_AGENT_DIR="+dir, "PATH="+filepath.Dir(bin)+string(os.PathListSeparator)+os.Getenv("PATH")))
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if err != nil {
@@ -601,10 +682,9 @@ func piRepoPage(q string) string {
 	return src
 }
 
-// piLatest is the registry's latest of an npm package: the registry in
-// use first, then npm's own, as the search asks them.
-func piLatest(name string) (piListed, []string, error) {
-	var doc struct {
+// piLatest is the selected registry's latest of an npm package.
+func piLatest(registry plugin.RegistryInUse, name string) (piListed, []string, error) {
+	type packageDoc struct {
 		Name        string          `json:"name"`
 		Version     string          `json:"version"`
 		Description string          `json:"description"`
@@ -615,16 +695,9 @@ func piLatest(name string) (piListed, []string, error) {
 			Name string `json:"name"`
 		} `json:"_npmUser"`
 	}
-	path := "/" + url.PathEscape(name) + "/latest"
-	npm := strings.TrimSuffix(piNPMURL, "/-/v1/search")
-	err := errors.New("no registry")
-	if r := strings.TrimRight(piRegistry(), "/"); r != "" && r != npm {
-		err = getJSON(r+path, &doc)
-	}
+	doc, err := piRegistryJSON[packageDoc](registry, name, "/"+url.PathEscape(name)+"/latest")
 	if err != nil {
-		if err = getJSON(npm+path, &doc); err != nil {
-			return piListed{}, nil, err
-		}
+		return piListed{}, nil, err
 	}
 	if doc.Name != name {
 		return piListed{}, nil, fmt.Errorf("the registry answered %q for %s", doc.Name, name)
@@ -657,7 +730,7 @@ func PiDirectAt(q string, found []PiMarketPackage) *PiMarketPackage {
 		return nil
 	}
 	if piKind(src) == "npm" {
-		got, kw, err := piLatest(name)
+		got, kw, err := piLatest(piRegistry(), name)
 		if bare && (err != nil || !slices.Contains(kw, "pi-package")) {
 			return nil
 		}

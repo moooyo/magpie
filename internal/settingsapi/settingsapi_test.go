@@ -10,6 +10,10 @@ import (
 	"strings"
 	"testing"
 
+	toml "github.com/pelletier/go-toml/v2"
+
+	"github.com/yetone/magpie/internal/agentenv"
+	"github.com/yetone/magpie/internal/library"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/testenv"
@@ -39,6 +43,8 @@ func sample(t reflect.Type, key string, was reflect.Value) reflect.Value {
 			s = "off" // a model is checked against the catalog
 		case "videoGen":
 			s = "studio/clip-1" // a video model, videoModel's
+		case "npmRegistry":
+			s = "https://npm.example/repo"
 		}
 		for _, c := range Choices[key] {
 			if c != was.String() {
@@ -258,6 +264,100 @@ func TestRefusedValueWritesNothing(t *testing.T) {
 	if _, err := Body(settings.Load(), "port", json.RawMessage(`1`)); err == nil {
 		t.Error("Body took port, which has a route of its own")
 	}
+}
+
+func TestNPMRegistryValidatesOnlyWhenSent(t *testing.T) {
+	cur := settings.Defaults()
+	// A bad hand-edited value doesn't stop unrelated Settings or CLI saves.
+	cur.NPMRegistry = "ftp://npm.example/repo"
+	body, err := Body(cur, "theme", json.RawMessage(`"dark"`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := Merge(body, cur, false)
+	if err != nil || in.NPMRegistry != cur.NPMRegistry || in.Theme != "dark" {
+		t.Fatalf("unrelated save: registry %q, theme %q, err %v", in.NPMRegistry, in.Theme, err)
+	}
+
+	for _, input := range []string{
+		`"ftp://npm.example/repo"`, `"https://user:private@npm.example/repo"`,
+		`"https://npm.example/repo?"`, `"https://npm.example/repo#"`, `true`,
+	} {
+		if _, err := Merge([]byte(`{"npmRegistry":`+input+`}`), cur, false); err == nil || strings.Contains(err.Error(), "private") {
+			t.Errorf("bad registry %s: %v", input, err)
+		}
+	}
+	for _, c := range []struct{ input, want string }{
+		{`"  http://127.0.0.1:8765/repository/npm///  "`, "http://127.0.0.1:8765/repository/npm"},
+		{`""`, ""},
+	} {
+		in, err := Merge([]byte(`{"npmRegistry":`+c.input+`}`), cur, false)
+		if err != nil || in.NPMRegistry != c.want {
+			t.Errorf("registry %s: %q, %v; want %q", c.input, in.NPMRegistry, err, c.want)
+		}
+	}
+}
+
+func TestNPMRegistrySaveRefreshesManagedMCP(t *testing.T) {
+	home(t)
+	root, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(root, "bin")
+	testenv.Program(t, filepath.Join(bin, "codex"), "#!/bin/sh\nexit 1\n")
+	if err := os.WriteFile(filepath.Join(bin, "codex.exe"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin) // no real package manager or agent executable
+	for _, key := range agentenv.Vars {
+		t.Setenv(key, "")
+	}
+	cfg := filepath.Join(root, ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(cfg), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfg, []byte("[mcp_servers.private]\ncommand = 'ignore-me'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// bunx is emitted directly; this fixture never warms or runs a package.
+	s := library.Server{Name: "managed", Transport: "stdio", Command: "bunx", Args: []string{"demo-mcp"}, Agents: []string{"codex"}}
+	if res, err := library.SaveServer("", s); err != nil || len(res.Problems) > 0 {
+		t.Fatalf("setting up managed MCP: %+v, %v", res, err)
+	}
+	check := func(want string) {
+		t.Helper()
+		b, err := os.ReadFile(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc struct {
+			Servers map[string]struct {
+				Command string            `toml:"command"`
+				Env     map[string]string `toml:"env"`
+			} `toml:"mcp_servers"`
+		}
+		if err := toml.Unmarshal(b, &doc); err != nil {
+			t.Fatal(err)
+		}
+		managed := doc.Servers["managed"]
+		if managed.Command == "" || managed.Env["BUN_CONFIG_REGISTRY"] != want || doc.Servers["private"].Command != "ignore-me" {
+			t.Fatalf("registry should be %q in the managed MCP only; entries: %+v", want, doc.Servers)
+		}
+	}
+	check("")
+	if _, _, err := Apply([]byte(`{"npmRegistry":"https://first.example/npm/"}`), false); err != nil {
+		t.Fatal(err)
+	}
+	check("https://first.example/npm/")
+	if _, err := SetPluginRegistry("https://second.example/npm"); err != nil {
+		t.Fatal(err)
+	}
+	check("https://second.example/npm/")
+	if _, _, err := Apply([]byte(`{"npmRegistry":""}`), false); err != nil {
+		t.Fatal(err)
+	}
+	check("")
 }
 
 // "Don't ask again" on the Quit question (zhujiu on Discord) holds across

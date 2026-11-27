@@ -19,6 +19,7 @@ import (
 	"github.com/yetone/magpie/internal/pluginrt"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/settingsapi"
 	"golang.org/x/term"
 )
 
@@ -34,7 +35,7 @@ const pluginUsage = `usage: magpie plugin [list] [--json]
        magpie plugin move|migrate <subscription>   run a built-in subscription's accounts on its community plugin
        magpie plugin builtin [on|off <id>]         list magpie's built-in plugins (Sessions, Library, routing groups…), or turn one on or off
        magpie plugin preset essentials|all         start the built-in plugins from the Essentials preset, or from all of them
-       magpie plugin registry [<url> | default]   show the npm registry plugins are installed from and npm is asked of, and where it comes from; or set one (an http:// or https:// address) before your .npmrc's, .bunfig.toml's and the 国内镜像 switch's, default to drop it
+       magpie plugin registry [<url> | default]    show the effective plugin registry and its source; set the Magpie-wide npm registry (same as magpie settings set npmRegistry), or clear it with default
        magpie plugin dump [--json]                 what plugins.yml comes to: each built-in plugin, its config, and the layer each value is from`
 
 // pluginCmd: `magpie plugin …` — OpenCode's provider plugins and pi's
@@ -193,13 +194,15 @@ func pluginCmd(args []string) error {
 			fmt.Println(pluginUsage)
 			return nil
 		}
-		r := plugin.Registry()
+		var r plugin.RegistryInUse
 		if len(rest) == 1 {
 			var err error
-			if r, err = plugin.SetRegistry(rest[0]); err != nil {
+			if r, err = settingsapi.SetPluginRegistry(rest[0]); err != nil {
 				return err
 			}
 			fmt.Print(green.Render("✓"), " ")
+		} else {
+			r = plugin.Registry()
 		}
 		fmt.Println(r.URL, muted.Render("("+registryFrom(r)+")"))
 		return nil
@@ -892,11 +895,11 @@ func sayAgentBack(a *agent.Agent) {
 	fmt.Println(faint.Render("  " + a.Name + " is disconnected from magpie, back to what it had before; with the plugin back, connecting it (its switch on the Agents page) puts back the model it was on"))
 }
 
-// registryFrom says where the npm registry in use came from.
+// registryFrom says where the effective registry Plugins uses came from.
 func registryFrom(r plugin.RegistryInUse) string {
 	switch r.From {
 	case plugin.FromMagpie:
-		return "set in magpie; magpie plugin registry default drops it"
+		return "Magpie's default npm registry; magpie settings reset npmRegistry clears it"
 	case plugin.FromEnv:
 		return "from " + r.Var
 	case plugin.FromShell:

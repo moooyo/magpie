@@ -9702,6 +9702,15 @@ magpie.plugin("library", (ctx) => {
     pi: { q: "", items: null, error: "", loading: false, seq: 0, timer: 0, shown: 0 },
     claude: { q: "", items: null, error: "", loading: false, seq: 0, timer: 0, shown: 0 },
   };
+  window.libraryNPMRegistryChanged = () => {
+    const m = market.pi;
+    clearTimeout(m.timer);
+    m.seq++;
+    m.items = m.direct = m.failed = null;
+    m.error = "";
+    m.loading = false;
+    if (page.getClientRects().length && page.querySelector('.mk[data-market="pi"]')) fetchMarket("pi");
+  };
   // how many cards a list shows at first, and each Show more adds
   const MARKET_PAGE = 60;
   // Who uses each server, by its market id: the computers whose library

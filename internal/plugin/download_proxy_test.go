@@ -64,7 +64,7 @@ func TestPluginDownloadsTakeTheirOwnProxy(t *testing.T) {
 		t.Fatalf("the plugins list through plugin downloads' proxy: %q %v", b, err)
 	}
 	const reg = "http://npm.example.invalid/@me%2fx"
-	if b, err := fetchRegistry(ctx, reg, "tok", 1<<10); err != nil || !strings.Contains(string(b), "ok") {
+	if b, err := fetchRegistry(ctx, "http://npm.example.invalid", "/@me%2fx", "tok", true, 1<<10); err != nil || !strings.Contains(string(b), "ok") {
 		t.Fatalf("a registry of the user's through plugin downloads' proxy: %q %v", b, err)
 	}
 	const bunZip = "http://github.example.invalid/bun.zip"

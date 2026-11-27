@@ -15,7 +15,7 @@
   let taggedKind = "";   // its kind: "slow", "limited" or ""
   let taggedMissing = 0; // ...this many repositories it named couldn't be read
   let topic = "magpie-plugin";
-  const npm = {};        // /api/plugins/npm: package → what npm says of it
+  let npm = {};          // /api/plugins/npm: package → what the current registry says of it
   const heads = {};      // /api/plugins/git: a git plugin's spec → the commit its repository is at
   let failed = "";       // why what's installed couldn't be loaded
   let failedList = "";   // ...and the plugins suggested
@@ -143,9 +143,35 @@
     for (const e of mine?.plugins || []) if (onNPM(e.spec) && npm[name(e.spec)]?.version) e.latest = npm[name(e.spec)].version;
     for (const e of mine?.plugins || []) if (isGit(e.spec) && heads[e.spec]) e.head = heads[e.spec];
   }
+  const explicitRegistry = (m) => m?.registry?.from === "magpie" ? m.registry.url : "";
+  function setMine(next) {
+    const changed = !!mine && explicitRegistry(mine) !== explicitRegistry(next);
+    if (changed) {
+      // Neither versions nor download counts from the old upstream belong here.
+      npm = {};
+      npmTries = 0;
+      npmAnswered = false;
+      checked = null;
+      tagged = null;
+      if (view === "plugins") loadTagged().then(drawBody);
+      for (const l of listings || []) delete l.npm;
+      if (next.plugins === mine.plugins) for (const e of next.plugins || []) if (onNPM(e.spec)) delete e.latest;
+      if (hits) {
+        const s = query.trim();
+        hits = { q: s, loading: true };
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(() => searchNPM(s), 350);
+      }
+    }
+    mine = next;
+    return changed;
+  }
   async function loadMine() {
+    const from = npm, since = prefsWrites;
     try {
-      mine = await api("plugins");
+      const next = await api("plugins");
+      if (from !== npm || mine && !prefsSettled(since)) return;
+      setMine(next);
       failed = "";
       // a plugin turned on or off brings its page's tab, or takes it
       window.loadPluginPages?.();
@@ -169,8 +195,10 @@
   // older than its ten minutes comes at once, marked stale, and is asked
   // again with wait, drawn when GitHub's answer is in (the owner, 11-27).
   async function loadTagged(again) {
+    const from = npm;
     try {
       const r = await api("plugins/github" + (again === "wait" ? "?wait=1" : again ? "?again=1" : ""));
+      if (from !== npm) return;
       if (r.stale && !again) loadTagged("wait").then(drawBody);
       const got = (r.repos || []).map(ghListing);
       if (!(r.error && !got.length && tagged?.length)) tagged = got;
@@ -179,6 +207,7 @@
       taggedMissing = r.missing || 0;
       if (r.topic) topic = r.topic;
     } catch (e) {
+      if (from !== npm) return;
       taggedErr = e.message || String(e);
       taggedKind = "";
       taggedMissing = 0;
@@ -186,9 +215,11 @@
     }
   }
   async function loadListings() {
+    const from = npm;
     try {
       const r = await api("plugins/listings");
       listings = r.listings || [];
+      if (from !== npm) for (const l of listings) delete l.npm;
       failedList = "";
     } catch (e) {
       failedList = e.message;
@@ -200,22 +231,29 @@
   let npmTries = 0;
   let npmAnswered = false; // npm was asked once: no downloads then means none to rank by
   let countsGone = false; // plugincounts.js didn't load: no magpie counts to wait for
-  let weekPicks;
+  let drawWeekPicks;
   async function askNPM(only) {
+    const from = npm;
     const names = [...new Set([...(listings || []).map((l) => l.package), ...(mine?.plugins || []).filter((e) => onNPM(e.spec)).map((e) => name(e.spec))])]
       .filter((n) => !only || !npm[n]);
     if (!names.length) { if (!npmAnswered) { npmAnswered = true; drawBody(); } return; }
     try {
       const r = await api("plugins/npm?names=" + encodeURIComponent(names.join(",")));
-      Object.assign(npm, r.npm || {});
+      Object.assign(from, r.npm || {});
     } catch {}
+    if (from !== npm) return;
     npmAnswered = true;
     merge();
     // one npm said nothing of: unknown (Install), asked again
     let u = 0;
     for (const l of listings || []) if (!l.npm || l.npm.u) u = l.npm = { weekly: 0, u: 1 };
-    if (u && npmTries++ < 4) setTimeout(() => askNPM(true), 15000);
+    if (u && npmTries++ < 4) setTimeout(() => from === npm && askNPM(true), 15000);
     drawBody();
+  }
+  function changeRegistry(registry) {
+    setMine({ ...mine, registry });
+    draw();
+    askNPM();
   }
 
   // the commit each git plugin's repository is at now: drawn when it
@@ -248,15 +286,10 @@
       providers ? null : loadProviders().then(drawBody, () => {}),
     ];
     import("./plugincounts.js").then(() => window.pmCounts.load(drawBody), () => { countsGone = true; drawBody(); });
-    if (!weekPicks) {
-      import("./pluginweek.js").then(({ picks }) => {
-        weekPicks = picks;
-        drawBody();
-      }, () => {
-        weekPicks = () => null;
-        drawBody();
-      });
-    }
+    if (!drawWeekPicks) import("./pluginweek.js").then(({ weekPicks }) => {
+      drawWeekPicks = weekPicks({ el, t, usersOf, likesOf, hotOf, byHot, entryOf, opens, logo, kindOf, short: SHORT, byline, count, summary, detail, actionFor });
+      drawBody();
+    }, () => { drawWeekPicks = () => null; drawBody(); });
     import("./pluginpartners.js").then(drawBody, () => {});
     import("./pluginglide.js").catch(() => {});
     await Promise.all(parts);
@@ -279,13 +312,16 @@
     const mark = backAt = performance.now();
     let m, p;
     try { [m, p] = await Promise.all([api("plugins"), api("providers")]); } catch { return; }
+    const from = npm;
     const ns = (m.plugins || []).filter((e) => onNPM(e.spec)).map((e) => name(e.spec));
-    if (ns.length) try { Object.assign(npm, (await api("plugins/npm?names=" + encodeURIComponent(ns))).npm); } catch {}
+    let learned;
+    if (explicitRegistry(m) === explicitRegistry(mine) && ns.length) try { learned = (await api("plugins/npm?names=" + encodeURIComponent(ns))).npm; } catch {}
     // read since (an action's, the page's own load): that one stands
-    if (backAt !== mark) return;
+    if (backAt !== mark || from !== npm) return;
     if (view !== "plugins" || midway()) { backAt = 0; return; }
     const was = JSON.stringify([mine, providers?.plugins]);
-    mine = m;
+    const changed = setMine(m);
+    Object.assign(npm, learned);
     providers = p;
     if (m.jsRoutings) state.jsRoutings = m.jsRoutings;
     failed = "";
@@ -295,6 +331,7 @@
     window.agentsStale?.();
     draw();
     window.renderPluginDot?.();
+    if (changed) askNPM();
     askGit(true);
   };
   // the sidebar's dot, followed: Plugins opens on Installed, where the
@@ -340,7 +377,7 @@
     window.agentsStale?.();
     try {
       const [m, p] = await Promise.all([api("plugins"), api("providers")]);
-      mine = m;
+      setMine(m);
       providers = p;
       // a routing the plugin serves is in every routing picker at once
       if (m.jsRoutings) state.jsRoutings = m.jsRoutings;
@@ -372,7 +409,7 @@
       // a read made since (an action's, the page's own load) stands
       if (backAt !== mark || view !== "plugins" || midway()) return awaitNamed(tries + 1);
       const was = JSON.stringify([mine, providers?.plugins]);
-      mine = m;
+      const changed = setMine(m);
       providers = p;
       if (m.jsRoutings) state.jsRoutings = m.jsRoutings;
       merge();
@@ -380,6 +417,7 @@
         draw();
         window.renderPluginDot?.();
       }
+      if (changed) askNPM();
       awaitNamed(tries + 1);
     }, 1000);
   }
@@ -406,11 +444,17 @@
   // Update all, installs it as before. Nothing is installed by the check.
   async function checkUpdates() {
     if (checking || busy.size) return;
+    const from = npm;
     checking = true;
     draw();
     try {
       const r = await api("plugins/check", {});
-      mine = r.state || mine;
+      if (from !== npm) return;
+      if (r.state && setMine(r.state)) {
+        // The check began before the switch. Refill Discover from the new source.
+        askNPM();
+        return;
+      }
       const by = {};
       for (const c of r.plugins || []) {
         by[c.spec] = c;
@@ -437,11 +481,12 @@
         } else status(msg, "ok");
       }
     } catch (e) {
-      status(t("Couldn't check for updates: {error}", { error: e.message }), "err", 8000);
+      if (from === npm) status(t("Couldn't check for updates: {error}", { error: e.message }), "err", 8000);
+    } finally {
+      checking = false;
+      draw();
+      window.renderPluginDot?.();
     }
-    checking = false;
-    draw();
-    window.renderPluginDot?.();
   }
   // why npm said nothing of a plugin, in the page's words; a git one's
   // repository, in its own
@@ -813,71 +858,22 @@
     box.onkeydown = (ev) => { if (ev.target === box && (ev.key === "Enter" || ev.key === " ")) { ev.preventDefault(); detail(l); } };
   };
 
-  function hero(l) {
-    const box = el("article", "pm-hero");
-    opens(box, l);
-    const top = el("div", "pm-htop");
-    const who = el("div", "pm-who");
-    const nm = el("div", "pm-name");
-    nm.append(el("b", "", l.name));
-    who.append(nm, byline(l));
-    const lg = logo(l.icon || l.npm?.icon, true, kindOf(l));
-    lg.classList.add("hero");
-    top.append(lg, who);
-    const stats = el("div", "pm-stats");
-    const stat = (v, k) => { const s = el("div", "pm-stat"); s.append(el("b", "", v), el("span", "", k)); stats.append(s); };
-    const u = usersOf(l);
-    if (u) stat(count(u), t("Users"));
-    if (hotOf(l) || !u) stat(count(hotOf(l)), t("Downloads last week"));
-    stat(t(SHORT[kindOf(l)]), t("Kind"));
-    if (l.npm?.version) stat("v" + l.npm.version, t("Version"));
-    const acts = el("div", "pm-hact");
-    const more = el("button", "pm-act ghost", t("Details"));
-    more.type = "button";
-    more.onclick = (ev) => { ev.stopPropagation(); detail(l); };
-    acts.append(actionFor(l.package, l.name, l), more);
-    box.append(el("div", "pm-eyebrow", t("Today's pick")), top, el("p", "pm-hsum", summary(l)), stats, acts);
-    return box;
-  }
-  function rankList(title, note, list, line) {
-    const box = el("div", "pm-rank");
-    const h = el("div", "pm-rhead");
-    h.append(el("b", "", title), el("span", "", note));
-    box.append(h);
-    list.forEach((l, i) => {
-      const row = el("div", "pm-rrow");
-      opens(row, l);
-      const who = el("div", "pm-rwho");
-      who.append(el("b", "", l.name), el("span", "", line(l)));
-      row.append(el("span", "pm-rnum", String(i + 1)), logo(l.icon || l.npm?.icon, false, kindOf(l)), who, actionFor(l.package, l.name, l));
-      box.append(row);
-    });
-    return box;
-  }
   function recSection(all) {
-    // GitHub's list too: a repository there can lead Most used or Most
-    // liked, so the ranks don't move once drawn
-    const p = npmAnswered && tagged && (countsGone || window.pmCounts?.answered)
-      ? weekPicks?.(all, { usersOf, likesOf, hotOf, byHot, entryOf }) : undefined;
-    if (p === null) return null;
+    // A GitHub repository can lead Most used or Most liked. Wait for that
+    // list too, so the ranks don't move after drawing.
+    const picks = npmAnswered && tagged && (countsGone || window.pmCounts?.answered) ? drawWeekPicks?.(all) : undefined;
+    if (picks === null) return null;
     const sec = el("section", "pm-sec pm-recs");
     const h = el("div", "pm-rectitle");
     h.append(el("h2", "", t("This week")), el("span", "", new Date().toLocaleDateString(intlLang(), { month: "long", day: "numeric" })));
-    const grid = el("div", "pm-rec");
-    if (!p) {
-      grid.classList.add("ghost");
+    const grid = picks || el("div", "pm-rec ghost");
+    if (!picks) {
       grid.setAttribute("aria-hidden", "true");
       for (const c of ["pm-hero", "pm-rank", "pm-rank"]) {
         const g = el("div", c + " ghost");
         for (let i = 0; i < 5; i++) g.append(el("div", "sk"));
         grid.append(g);
       }
-    } else {
-      grid.append(hero(p.day));
-      if (p.used.length) grid.append(rankList(t("Most used"), t("in magpie, last week"), p.used, (l) => t(SHORT[kindOf(l)]) + " · " + t("{n} use it", { n: count(usersOf(l)) })));
-      else grid.append(rankList(t("Most downloaded"), t("last week, on npm"), p.downloaded, (l) => t(SHORT[kindOf(l)]) + " · ↓" + t("{n}/week", { n: count(hotOf(l)) })));
-      if (p.liked.length) grid.append(rankList(t("Most liked"), t("liked in magpie"), p.liked, (l) => "♥ " + count(likesOf(l)) + " · " + t(SHORT[kindOf(l)])));
-      else grid.classList.add("two");
     }
     sec.append(h, grid);
     return sec;
@@ -1067,7 +1063,9 @@
     b.setAttribute("role", "switch");
     b.setAttribute("aria-checked", on ? "true" : "false");
     b.setAttribute("aria-label", t("Mirrors in China"));
-    b.title = t("Download the plugin list, plugins and Bun from mirrors in China first (npmmirror, jsDelivr), their official addresses after. Each is a copy of the very file, checked as the original is");
+    b.title = explicitRegistry(mine)
+      ? t("Use mirrors in China for the plugin list and Bun. The Magpie-wide npm registry still applies to npm packages.")
+      : t("Download the plugin list, plugins and Bun from mirrors in China first (npmmirror, jsDelivr), their official addresses after. Each is a copy of the very file, checked as the original is");
     const sw = el("span", "lib-switch" + (on ? " on" : ""));
     sw.append(el("i"));
     b.append(el("span", "", t("Mirrors in China")), sw);
@@ -1092,13 +1090,14 @@
   }
 
   async function searchNPM(s) {
+    const from = npm;
     try {
       const r = await api("plugins/search?q=" + encodeURIComponent(s));
-      if (hits?.q === s) hits = { q: s, list: r.hits };
+      if (from === npm && hits?.q === s) hits = { q: s, list: r.hits };
     } catch (e) {
-      if (hits?.q === s) hits = { q: s, error: e.message };
+      if (from === npm && hits?.q === s) hits = { q: s, error: e.message };
     }
-    if (hits?.q === s) drawBody();
+    if (from === npm && hits?.q === s) drawBody();
   }
 
   page.addEventListener("scroll", () => page.querySelector(".pm-head")?.classList.toggle("stuck", page.scrollTop > 0), { passive: true });
@@ -1173,7 +1172,7 @@
       out.push(manual(), footer());
       if (mine?.registry) {
         out.push(regBox = regBox || el("div", "pm-registry"));
-        import("./registry.js").then(() => pmRegistry(regBox, mine, askNPM), statusTErr);
+        import("./registry.js").then(() => pmRegistry(regBox, mine, changeRegistry), statusTErr);
       }
       const at = shelfInSight();
       replaceKeeping(body, out);

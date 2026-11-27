@@ -52,7 +52,7 @@ func TestNpxServerRunsByNode(t *testing.T) {
 	cfg := filepath.Join(h, ".codex/config.toml")
 	installs := make(chan string, 4)
 	release := make(chan struct{})
-	npxInstall = func(spec, npx, dir string) error {
+	npxInstall = func(spec, npx, dir, registry string) error {
 		installs <- spec
 		<-release
 		pkg := filepath.Join(dir, "node_modules", "@acme", "mcp")
@@ -116,7 +116,7 @@ func TestNpxServerRunsByNode(t *testing.T) {
 	}
 
 	// out of the library, the install goes a day after its last
-	dir := npxDir("@acme/mcp@1.0.0")
+	dir := npxDir("@acme/mcp@1.0.0", "")
 	write(t, filepath.Join(dir, ".installed"), "@acme/mcp@1.0.0\n")
 	ok(t)(Sync())
 	if _, err := os.Stat(dir); err != nil {

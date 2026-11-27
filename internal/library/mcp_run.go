@@ -41,6 +41,7 @@ import (
 
 	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/npmregistry"
 	"github.com/yetone/magpie/internal/proc"
 )
 
@@ -55,9 +56,16 @@ type runSpec struct {
 	Command string            `json:"command"`
 	Args    []string          `json:"args"`
 	Env     map[string]string `json:"env"`
+	// Registry is the implicit upstream when the command was given to Codex.
+	Registry string `json:"registry,omitempty"`
 	// Idle is how long the server is kept with nothing asked of it, 0
 	// for runIdle, -1 for as long as magpie runs (Server.idleFor)
 	Idle time.Duration `json:"idle,omitempty"`
+
+	// Keep the original package command so another Magpie process can
+	// change the upstream without leaving this gateway on an old install.
+	npmSource *Server
+	upstream  string
 }
 
 // idle is how long a session's server of this spec is kept with nothing
@@ -77,6 +85,10 @@ func (r runSpec) key() string { b, _ := json.Marshal(r); return string(b) }
 // specOf is the command magpie runs s with, false for a server it doesn't
 // run: a remote one, or one with a variable magpie's environment hasn't.
 func specOf(s *Server) (runSpec, bool) {
+	return specAt(s, npmregistry.Configured())
+}
+
+func specAt(s *Server, registry string) (runSpec, bool) {
 	if s.Remote() || s.Command == "" {
 		return runSpec{}, false
 	}
@@ -85,7 +97,7 @@ func specOf(s *Server) (runSpec, bool) {
 	if len(unset) > 0 {
 		return runSpec{}, false
 	}
-	r := runSpec{Command: cmd, Args: slices.Clone(args), Env: env}
+	r := runSpec{Command: cmd, Args: slices.Clone(args), Env: env, Registry: npmRegistryFor(registry, cmd, args, own)}
 	if s.KeepAlive || s.IdleTimeout > 0 {
 		r.Idle = -1
 		if d := s.idleFor(runIdle); d > 0 {
@@ -152,8 +164,8 @@ func init() {
 
 // runVia is s as an agent that runsFor is given it, and the spec it is
 // run with; false for one magpie doesn't run.
-func runVia(s *Server, base string) (*Server, runSpec, bool) {
-	spec, ok := specOf(s)
+func runVia(s *Server, base, registry string) (*Server, runSpec, bool) {
+	spec, ok := runPackageSpec(s, registry)
 	if !ok {
 		return s, runSpec{}, false
 	}
@@ -161,6 +173,14 @@ func runVia(s *Server, base string) (*Server, runSpec, bool) {
 	c.Transport, c.Command, c.Args, c.Env = "http", "", nil, nil
 	c.URL = strings.TrimRight(base, "/") + RunPath + url.PathEscape(s.Name)
 	return &c, spec, true
+}
+
+func runPackageSpec(s *Server, registry string) (runSpec, bool) {
+	spec, ok := specAt(npxDirect(s, registry), registry)
+	if c, args, env := launchCmd(s, ""); ok && npmRegistryFor("configured", c, args, env) != "" {
+		spec.npmSource, spec.upstream = s, registry
+	}
+	return spec, ok
 }
 
 // runGiven records the servers a sync gave through the gateway, and ends
@@ -180,13 +200,14 @@ func runGiven(given map[string]runSpec) {
 	for _, s := range stop {
 		spec, ok := given[s.name]
 		s.mu.Lock()
-		changed := !ok || spec.key() != s.spec.key()
-		if changed {
-			s.spec, s.gone = spec, !ok
+		var old *runChild
+		if !ok || spec.key() != s.spec.key() {
+			old, s.child = s.child, nil
 		}
+		s.spec, s.gone = spec, !ok
 		s.mu.Unlock()
-		if changed {
-			s.stop()
+		if old != nil {
+			old.end()
 		}
 	}
 }
@@ -199,6 +220,11 @@ func runSpecOf(name string) (runSpec, bool) {
 	runs.Unlock()
 	if given != nil {
 		spec, ok := given[name]
+		if spec.npmSource != nil {
+			if current := npmregistry.Configured(); current != spec.upstream {
+				return runPackageSpec(spec.npmSource, current)
+			}
+		}
 		return spec, ok
 	}
 	mu.Lock()
@@ -211,7 +237,7 @@ func runSpecOf(name string) (runSpec, bool) {
 	if s == nil || !slices.Contains(s.Agents, "codex") || s.Hub == HubDirect {
 		return runSpec{}, false
 	}
-	return specOf(npxDirect(s))
+	return runPackageSpec(s, npmregistry.Configured())
 }
 
 type runSession struct {
@@ -238,10 +264,22 @@ func newSessionID() string {
 // one magpie was restarted under is taken up as it is.
 func session(sid, name string, spec runSpec, init json.RawMessage) *runSession {
 	runs.Lock()
-	defer runs.Unlock()
 	if s := runs.sessions[sid]; s != nil && s.name == name {
+		runs.Unlock()
+		if spec.npmSource != nil && npmregistry.Configured() == spec.upstream {
+			s.mu.Lock()
+			var old *runChild
+			if !s.gone && s.spec.upstream != spec.upstream {
+				s.spec, old, s.child = spec, s.child, nil
+			}
+			s.mu.Unlock()
+			if old != nil {
+				old.end()
+			}
+		}
 		return s
 	}
+	defer runs.Unlock()
 	if runs.sessions == nil {
 		runs.sessions = map[string]*runSession{}
 	}
@@ -320,6 +358,11 @@ func (s *runSession) ensure() (*runChild, json.RawMessage, error) {
 		return nil, nil, err
 	}
 	s.mu.Lock()
+	if s.gone || s.spec.key() != spec.key() {
+		s.mu.Unlock()
+		c.end()
+		return nil, nil, errors.New("the MCP server configuration changed during startup; try again")
+	}
 	s.child = c
 	s.mu.Unlock()
 	return c, res, nil
@@ -331,11 +374,11 @@ func (s *runSession) ensure() (*runChild, json.RawMessage, error) {
 func (s *runSession) deliver(c *runChild, line []byte, id json.RawMessage, method string) {
 	switch method {
 	case "notifications/tools/list_changed":
-		forget(s.spec, "tools/list")
+		forget(c.spec, "tools/list")
 	case "notifications/prompts/list_changed":
-		forget(s.spec, "prompts/list")
+		forget(c.spec, "prompts/list")
 	case "notifications/resources/list_changed":
-		forget(s.spec, "resources/list", "resources/templates/list")
+		forget(c.spec, "resources/list", "resources/templates/list")
 	}
 	s.mu.Lock()
 	var to chan []byte
@@ -373,6 +416,7 @@ func (s *runSession) close(ch chan []byte) {
 
 // runChild is a server magpie started for a session.
 type runChild struct {
+	spec  runSpec
 	tree  *proc.Tree
 	in    io.WriteCloser
 	errs  *tail
@@ -436,7 +480,7 @@ func runStart(s *runSession, spec runSpec, init json.RawMessage) (*runChild, jso
 	cmd := proc.Command(prog, spec.Args...)
 	// as checkStdioAt starts it: from home, in magpie's environment with
 	// the server's own variables over it
-	cmd.Env = os.Environ()
+	cmd.Env = npmregistry.WithEnv(os.Environ(), spec.Registry)
 	if d := home(); d != "" {
 		cmd.Dir = d
 		if runtime.GOOS != "windows" {
@@ -446,9 +490,7 @@ func runStart(s *runSession, spec runSpec, init json.RawMessage) (*runChild, jso
 	if found != "" {
 		cmd.Env = withPath(cmd.Env, found)
 	}
-	for k, v := range spec.Env {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
+	cmd.Env = withMCPEnv(cmd.Env, spec.Env, npmregistry.Program(spec.Command))
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, nil, err
@@ -463,7 +505,7 @@ func runStart(s *runSession, spec runSpec, init json.RawMessage) (*runChild, jso
 	if err != nil {
 		return nil, nil, fmt.Errorf("couldn't start %s: %w", spec.Command, err)
 	}
-	c := &runChild{tree: tree, in: in, errs: errs, waits: map[string]chan json.RawMessage{}, done: make(chan struct{})}
+	c := &runChild{spec: spec, tree: tree, in: in, errs: errs, waits: map[string]chan json.RawMessage{}, done: make(chan struct{})}
 	go func() {
 		err := tree.Wait()
 		if err != nil && !errors.Is(err, os.ErrProcessDone) {
@@ -719,7 +761,7 @@ func ServeRun(w http.ResponseWriter, r *http.Request, name string) {
 			Result json.RawMessage `json:"result"`
 		}
 		if json.Unmarshal(b, &r) == nil && len(r.Result) > 0 {
-			remember(spec, m.Method, r.Result)
+			remember(c.spec, m.Method, r.Result)
 		}
 	}
 	if events == nil {
@@ -783,14 +825,14 @@ func runInitialize(w http.ResponseWriter, name string, spec runSpec, m rpcIn) {
 		s.last = time.Now()
 		s.mu.Unlock()
 	}()
-	_, res, err := s.ensure()
+	c, res, err := s.ensure()
 	if err != nil {
 		runReply(w, rpcError(m.ID, -32603, err.Error()))
 		return
 	}
 	if res != nil {
-		remember(spec, what, res)
-	} else if res = said(spec, what); res == nil {
+		remember(c.spec, what, res)
+	} else if res = said(c.spec, what); res == nil {
 		runReply(w, rpcError(m.ID, -32603, "the server "+name+" was started already"))
 		return
 	}

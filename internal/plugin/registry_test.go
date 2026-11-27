@@ -186,14 +186,14 @@ func TestLookupsAskTheUsersRegistry(t *testing.T) {
 	}, "\n"))
 	ctx := context.Background()
 
-	info, err := npmAsk(ctx, "opencode-x-auth")
+	info, err := npmAsk(ctx, Registry(), "opencode-x-auth")
 	if err != nil || info.Version != "1.2.3" {
 		t.Fatalf("npmAsk: %+v %v", info, err)
 	}
 	if p, err := Readme(ctx, "opencode-x-auth"); err != nil || !strings.Contains(p.Readme, "from mine") {
 		t.Fatalf("Readme: %+v %v", p, err)
 	}
-	if _, err := npmAsk(ctx, "@corp/opencode-y-auth"); err != nil {
+	if _, err := npmAsk(ctx, Registry(), "@corp/opencode-y-auth"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := searchNPM(ctx, "auth", func(string, []string) bool { return true }); err != nil {

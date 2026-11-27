@@ -19,6 +19,7 @@ import (
 	"github.com/yetone/magpie/internal/claudecode"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/lazyre"
+	"github.com/yetone/magpie/internal/npmregistry"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -100,7 +101,7 @@ type BiliView struct {
 	Version string      `json:"version,omitempty"`
 	Agents  []BiliAgent `json:"agents"`
 	URL     string      `json:"url"`
-	// Install is the command Install runs, "" when there is no npm
+	// Install is the default command Install runs, "" when there is no npm.
 	Install string `json:"install,omitempty"`
 	// ListErr is why bili plugin list said nothing magpie could read
 	ListErr string   `json:"listErr,omitempty"`
@@ -142,6 +143,9 @@ var biliRun = func(bin string, tools []string, timeout time.Duration, args ...st
 	cmd := proc.CommandContext(ctx, bin, args...)
 	cmd.Stdin = nil
 	cmd.Env = append(os.Environ(), "PATH="+biliPATH(bin, tools, os.Getenv("PATH")))
+	if len(args) >= 2 && args[0] == "plugin" && (args[1] == "install" || args[1] == "remove") {
+		cmd.Env = npmregistry.Env(cmd.Env)
+	}
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if err != nil {
@@ -750,7 +754,13 @@ func InstallBili() (*BiliView, error) {
 	if c == nil {
 		return nil, fmt.Errorf("npm isn't installed — install Node.js first, or see %s", BiliURL)
 	}
-	out, err := runPlain(c, 5*time.Minute)
+	args := c
+	if registry := npmregistry.Configured(); registry != "" {
+		// Only this install gets npm's flag. npm still reads scope mappings
+		// from .npmrc, and other runPlain callers don't get the override.
+		args = append(slices.Clone(c), "--registry="+registry)
+	}
+	out, err := runPlain(args, 5*time.Minute)
 	if err != nil {
 		return nil, err
 	}

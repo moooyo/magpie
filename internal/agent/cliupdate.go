@@ -33,6 +33,7 @@ import (
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/netproxy"
+	"github.com/yetone/magpie/internal/npmregistry"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/source"
@@ -88,6 +89,8 @@ type cliSpec struct {
 	// links lead, with forward slashes) is the one its vendor's installer
 	// put there
 	self func(bin, real string) []string
+	// selfNPM marks an updater that calls a package manager itself.
+	selfNPM bool
 	// at is where its vendor's installer puts the CLI under the home folder
 	// (.exe added on Windows), for an agent with no Bin: its command's name
 	// is other tools' too, so PATH can't say it is this one
@@ -251,7 +254,7 @@ var cliSpecs = map[string]cliSpec{
 		}},
 	// omo update, however it was installed: OmO's own updater, which moves
 	// the engine it pins (senpi) with it
-	"omo": {npm: []string{"omo-ai"}, scripts: true,
+	"omo": {npm: []string{"omo-ai"}, scripts: true, selfNPM: true,
 		self: func(bin, real string) []string { return []string{bin, "update"} }},
 	// mu-agent from npm: its own `mu update` updates Pi packages, not mu
 	"mu": {npm: []string{"mu-agent"}},
@@ -270,13 +273,24 @@ type updater struct {
 	admin  bool
 	prefix string
 	// latest is the newest its own updater would install (cliSpec.latest)
-	latest func() string
+	latest   func() string
+	selfNPM  bool   // cliSpec.selfNPM
+	registry string // the explicit upstream when this update started, also used on retry
 	// reshim is run after the update: the version manager whose shim the
 	// CLI was found as making shims for what it installed
 	reshim []string
 	// wsl is the distro the CLI is in and the update runs in, "" for this
 	// machine's (cliupdate_wsl.go)
 	wsl string
+}
+
+// packageUpdate reports whether the update runs a package manager directly
+// or uses a known wrapper around one.
+func (u *updater) packageUpdate() bool {
+	if u.via == "self" {
+		return u.selfNPM
+	}
+	return len(u.cmd) > 0 && npmregistry.Program(u.cmd[0])
 }
 
 // shown is the update as a person would type it.
@@ -306,7 +320,7 @@ func howInstalled(spec cliSpec, bin string) *updater {
 			if len(spec.npm) > 0 {
 				pkg = spec.npm[0]
 			}
-			u := &updater{via: "self", pkg: pkg, cmd: c, latest: spec.latest}
+			u := &updater{via: "self", pkg: pkg, cmd: c, latest: spec.latest, selfNPM: spec.selfNPM}
 			u.path = selfPath(spec, bin, slash)
 			return u
 		}
@@ -694,6 +708,28 @@ func installedVersion(bin string) string {
 // tests can fake it.
 var runVersion = proc.Version
 
+// noRegistryDowngrade keeps an explicitly configured, stale mirror from
+// turning a previously offered update into a downgrade of an installed CLI.
+func (u *updater) noRegistryDowngrade(installed string) error {
+	if u.registry != "" && u.packageUpdate() && installed != "" {
+		if latest := latestVersion(u); latest != "" && Newer(installed, latest) {
+			return fmt.Errorf("the configured npm registry offers %s, older than the installed %s", latest, installed)
+		}
+	}
+	return nil
+}
+
+// pinTarget gives a standalone updater the version already read for its
+// line, so it needn't look up latest itself. Package managers take no
+// version after their command.
+func (u *updater) pinTarget(spec cliSpec, before string) {
+	if spec.target && u.via == "self" {
+		if v := latestVersion(u); Newer(v, before) {
+			u.cmd = append(u.cmd, v)
+		}
+	}
+}
+
 // latestVersion is the newest version where u would update from.
 func latestVersion(u *updater) string {
 	if u.via == "brew" {
@@ -705,18 +741,21 @@ func latestVersion(u *updater) string {
 	if u.pkg == "" {
 		return ""
 	}
-	return latests.get("npm:"+u.pkg, "", 6*time.Hour, 15*time.Minute, func() (string, error) { return npmLatest(u.pkg) })
+	return latests.get("npm:"+u.pkg, u.registry, 6*time.Hour, 15*time.Minute, func() (string, error) { return npmLatest(u.pkg, u.registry) })
 }
 
-// npmRegistry is where npm's packages are read; a var so tests can serve one.
-var npmRegistry = "https://registry.npmjs.org/"
+// npmRegistry is the default npm registry; a var so tests can serve one.
+var npmRegistry = npmregistry.Default + "/"
 
-func npmLatest(pkg string) (string, error) {
+func npmLatest(pkg, registry string) (string, error) {
 	c := &http.Client{Timeout: 8 * time.Second}
-	req, _ := http.NewRequest("GET", npmRegistry+pkg+"/latest", nil)
+	req, err := http.NewRequest(http.MethodGet, npmRegistry+pkg+"/latest", nil)
+	if err != nil {
+		return "", err
+	}
 	req.Header.Set("User-Agent", "magpie")
 	req.Header.Set("Accept", "application/json")
-	resp, err := source.Do(c, req)
+	resp, err := npmregistry.Do(c, req, registry, pkg)
 	if err != nil {
 		return "", err
 	}
@@ -925,9 +964,13 @@ func (a *Agent) BinPath() string {
 // CLI is the agent's CLI: its version, the newest, and whether magpie can
 // update it, with its desktop app's version. ok is false for an agent with
 // neither a CLI magpie knows nor its app.
-func (a *Agent) CLI() (c CLI, ok bool) {
+func (a *Agent) CLI() (CLI, bool) {
+	return a.cli(npmregistry.Configured())
+}
+
+func (a *Agent) cli(registry string) (c CLI, ok bool) {
 	if a.WSL != "" {
-		return a.wslCLIInfo()
+		return a.wslCLIInfo(registry)
 	}
 	c.App = a.AppVersion()
 	bin, spec := a.cliBin()
@@ -944,6 +987,7 @@ func (a *Agent) CLI() (c CLI, ok bool) {
 	if u == nil {
 		return c, true
 	}
+	u.registry = registry
 	c.Via, c.Command, c.Admin = u.via, u.shown(), u.admin
 	c.Latest = latestVersion(u)
 	c.Update = c.Version != "" && c.Latest != "" && Newer(c.Latest, c.Version)
@@ -995,6 +1039,7 @@ func CLIs(wait time.Duration) (out map[string]CLI, pending bool) {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	out = map[string]CLI{}
+	registry := npmregistry.Configured()
 	for _, a := range Detected() {
 		kind := a.ID
 		if a.WSL != "" {
@@ -1007,7 +1052,7 @@ func CLIs(wait time.Duration) (out map[string]CLI, pending bool) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if c, ok := a.CLI(); ok {
+			if c, ok := a.cli(registry); ok {
 				mu.Lock()
 				out[a.ID] = c
 				mu.Unlock()
@@ -1087,10 +1132,18 @@ var runUpdate = func(ctx context.Context, u *updater) ([]byte, error) {
 	return cmd.CombinedOutput()
 }
 
-// updateEnv is the environment an update runs in: the proxy magpie's own
-// requests take (a SOCKS5 one bridged for bun, which can't use it: #1409),
-// and u's PATH first.
+// updateEnv adds the explicit registry only to package-manager updates.
 func updateEnv(u *updater) []string {
+	env := updateBaseEnv(u)
+	if u.packageUpdate() {
+		env = npmregistry.WithEnv(env, u.registry)
+	}
+	return env
+}
+
+// updateBaseEnv gives the update and its version check Magpie's proxy (a
+// SOCKS5 one bridged for bun, #1409), and u's PATH first.
+func updateBaseEnv(u *updater) []string {
 	env := netproxy.Env(os.Environ())
 	if u.via == "bun" {
 		env = netproxy.EnvForBun(env)
@@ -1102,8 +1155,8 @@ func updateEnv(u *updater) []string {
 			}
 		}
 	}
-	// the --version run after an update starts Cline, which would otherwise
-	// check for (and schedule) an update of its own
+	// Cline would otherwise check for (and schedule) an update of its own
+	// during the --version probe after an update.
 	return append(env, "NONINTERACTIVE=1", "HOMEBREW_NO_ENV_HINTS=1", "NO_COLOR=1", "CLINE_NO_AUTO_UPDATE=1")
 }
 
@@ -1154,15 +1207,12 @@ func (a *Agent) UpdateCLI() (CLI, error) {
 		return CLI{}, fmt.Errorf("%s is already being updated", a.Name)
 	}
 	defer updating.Delete(a.ID)
+	u.registry = npmregistry.Configured()
 	before := installedVersion(real)
-	if spec.target && u.via == "self" {
-		// the version the row promised, so its own updater needn't ask
-		// GitHub's API for the newest (see cliSpec.target); npm, bun,
-		// pnpm and brew take no version after their command
-		if v := latestVersion(u); Newer(v, before) {
-			u.cmd = append(u.cmd, v)
-		}
+	if err := u.noRegistryDowngrade(before); err != nil {
+		return CLI{}, err
 	}
+	u.pinTarget(spec, before)
 	ctx, cancel := context.WithTimeout(context.Background(), updateTimeout)
 	defer cancel()
 	if updateGOOS == "windows" && (u.via == "npm" || u.via == "bun" || u.via == "pnpm") {
@@ -1185,7 +1235,7 @@ func (a *Agent) UpdateCLI() (CLI, error) {
 	shimTargets.forget(bin)
 	// brew upgrade updates Homebrew first, which may know a newer one
 	latests.forget("brew:" + u.pkg)
-	c, _ := a.CLI()
+	c, _ := a.cli(u.registry)
 	if err != nil {
 		msg := lastLines(string(out), 3)
 		if msg == "" || errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -1222,7 +1272,7 @@ func (a *Agent) UpdateCLI() (CLI, error) {
 		if _, err := runUpdate(ctx, &again); err == nil {
 			versions.forget(real)
 			shimTargets.forget(bin)
-			c, _ = a.CLI()
+			c, _ = a.cli(u.registry)
 			broken = runsBroken(ctx, bin, u)
 		}
 	}
@@ -1240,7 +1290,7 @@ func (a *Agent) UpdateCLI() (CLI, error) {
 func runsBroken(ctx context.Context, bin string, u *updater) string {
 	ctx, cancel := context.WithTimeout(ctx, checkTimeout)
 	defer cancel()
-	out, code, err := runCheck(ctx, bin, updateEnv(u))
+	out, code, err := runCheck(ctx, bin, updateBaseEnv(u))
 	if err == nil || ctx.Err() != nil || code <= 0 || code == 127 || parseVersion(out) != "" {
 		return ""
 	}

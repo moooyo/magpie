@@ -4530,6 +4530,10 @@ img.nav-ic { border-radius: 3px; object-fit: contain; }
 .proxy-segs input:focus, input.words:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
 .proxy-segs input::placeholder, input.words::placeholder { color: var(--faint); }
 input.words { width: 240px; max-width: 100%; }
+#npmRegistryRow { flex-wrap: wrap; row-gap: 8px; }
+#npmRegistryRow .who { flex: 1 1 14em; min-width: 0; }
+#npmRegistryRow .name { white-space: normal; }
+#npmRegistryRow .val { max-width: 100%; }
 /* Settings → Long conversations: 272K or the size typed, beside it (#876) */
 .compact-at { display: flex; align-items: center; gap: 8px; margin-left: auto; flex: none; }
 .row.pref .compact-at .segs { margin-left: 0; }

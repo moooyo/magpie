@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yetone/magpie/internal/npmregistry"
 )
 
 // Plugins on GitHub that nobody listed: a repository its author tagged
@@ -101,9 +103,10 @@ var (
 )
 
 var (
-	taggedMu sync.Mutex
-	taggedL  []Tagged
-	taggedAt time.Time
+	taggedMu       sync.Mutex
+	taggedL        []Tagged
+	taggedAt       time.Time
+	taggedUpstream string
 	// taggedWhy is why taggedL isn't GitHub's whole answer: the search
 	// failed (taggedL is what it said before), or repositories it named
 	// couldn't be read. nil when it is.
@@ -164,6 +167,11 @@ func (e *TaggedMissing) Unwrap() error { return e.Why }
 func TaggedRepos(ctx context.Context) ([]Tagged, error) {
 	taggedMu.Lock()
 	defer taggedMu.Unlock()
+	r := Registry()
+	upstream := r.upstream()
+	if taggedUpstream != upstream {
+		taggedUpstream, taggedL, taggedAt, taggedWhy = upstream, nil, time.Time{}, nil
+	}
 	if taggedL != nil && time.Since(taggedAt) < taggedTTL {
 		return taggedL, taggedWhy
 	}
@@ -172,7 +180,7 @@ func TaggedRepos(ctx context.Context) ([]Tagged, error) {
 	}
 	// a magpie started again within the ten minutes: what GitHub said then,
 	// without the wait of asking (a package.json read for each)
-	if taggedL == nil {
+	if taggedL == nil && upstream == "" {
 		if fi, err := os.Stat(taggedCache()); err == nil && time.Since(fi.ModTime()) < taggedTTL {
 			if l := taggedOnDisk(); l != nil {
 				taggedL, taggedAt, taggedWhy = l, fi.ModTime(), nil
@@ -181,10 +189,10 @@ func TaggedRepos(ctx context.Context) ([]Tagged, error) {
 		}
 	}
 	last := taggedL
-	if last == nil {
+	if last == nil && upstream == "" {
 		last = taggedOnDisk()
 	}
-	if l, whole, missing, err := askListOrGitHub(ctx, last); err == nil {
+	if l, whole, missing, err := askListOrGitHub(ctx, r, last); err == nil {
 		taggedL, taggedAt, taggedWhy = l, time.Now(), nil
 		if !whole {
 			taggedAt = time.Now().Add(-taggedTTL + taggedRetry)
@@ -192,7 +200,7 @@ func TaggedRepos(ctx context.Context) ([]Tagged, error) {
 		if missing != nil {
 			taggedWhy = missing
 		}
-		if b, err := json.Marshal(l); err == nil {
+		if b, err := json.Marshal(l); err == nil && upstream == "" {
 			_ = os.MkdirAll(filepath.Dir(taggedCache()), 0o755)
 			_ = os.WriteFile(taggedCache(), b, 0o644)
 			// a magpie started again meanwhile asks again too
@@ -226,19 +234,22 @@ func TaggedAskAgain() {
 // without asking: what it last had (in memory, else on disk), however
 // old, and why that isn't GitHub's whole answer. fresh is whether
 // TaggedRepos would give it as it is, within taggedTTL; nil when there
-// is none. An ask under way holds taggedMu, so what is on disk stands
-// then: the Plugins page draws what it had rather than wait for GitHub
-// (the owner, 11-27: Discover's week waited on the whole list).
+// is none. An ask under way holds taggedMu, so the automatic-mode disk
+// cache can stand then. Never show an install source or version inferred
+// from a different upstream, even while a refresh is in progress.
 func TaggedStanding() (l []Tagged, fresh bool, err error) {
 	if os.Getenv("MAGPIE_PLUGIN_MARKET") == "off" {
 		return nil, false, nil
 	}
-	if !taggedMu.TryLock() {
-		return taggedOnDisk(), false, nil
+	upstream := npmregistry.Configured()
+	if taggedMu.TryLock() {
+		defer taggedMu.Unlock()
+		if taggedL != nil && taggedUpstream == upstream {
+			return taggedL, time.Since(taggedAt) < taggedTTL, taggedWhy
+		}
 	}
-	defer taggedMu.Unlock()
-	if taggedL != nil {
-		return taggedL, time.Since(taggedAt) < taggedTTL, taggedWhy
+	if upstream != "" {
+		return nil, false, nil
 	}
 	return taggedOnDisk(), false, nil
 }
@@ -248,7 +259,7 @@ func TaggedStanding() (l []Tagged, fresh bool, err error) {
 // it. whole is false when a repository was left out for want of an answer
 // in taggedWait: it is then as last had it, if it had it, and missing
 // counts those last didn't have.
-func askTagged(ctx context.Context, last []Tagged) (l []Tagged, whole bool, missing *TaggedMissing, err error) {
+func askTagged(ctx context.Context, registry RegistryInUse, last []Tagged) (l []Tagged, whole bool, missing *TaggedMissing, err error) {
 	type item struct {
 		FullName      string    `json:"full_name"`
 		HTMLURL       string    `json:"html_url"`
@@ -338,6 +349,9 @@ func askTagged(ctx context.Context, last []Tagged) (l []Tagged, whole bool, miss
 		}
 		asked[i] = t
 		key := it.FullName + "@" + it.Pushed.Format(time.RFC3339)
+		if upstream := registry.upstream(); upstream != "" {
+			key += "\x00" + upstream
+		}
 		seen[key] = true
 		readMu.Lock()
 		was, read := readRepo[key]
@@ -359,7 +373,7 @@ func askTagged(ctx context.Context, last []Tagged) (l []Tagged, whole bool, miss
 			defer func() { <-sem }()
 			pc, cancel := context.WithTimeout(bg, taggedEach)
 			defer cancel()
-			got, ok, read, rerr := readTagged(pc, t, branch)
+			got, ok, read, rerr := readTagged(pc, registry, t, branch)
 			if read {
 				readMu.Lock()
 				if ok {
@@ -444,7 +458,7 @@ func keyword(kw any, k string) bool {
 // npm's copy of the package it names: t as it is installed, whether it is
 // kept, and whether that is known (GitHub or npm not answering is not,
 // and it is read again next time), with the read that didn't answer.
-func readTagged(pc context.Context, t Tagged, branch string) (Tagged, bool, bool, error) {
+func readTagged(pc context.Context, registry RegistryInUse, t Tagged, branch string) (Tagged, bool, bool, error) {
 	if branch == "" {
 		branch = "HEAD"
 	}
@@ -520,7 +534,7 @@ func readTagged(pc context.Context, t Tagged, branch string) (Tagged, bool, bool
 	// published to npm from this repository: npm's copy is the one
 	// built to be installed (a repository often leaves its dist out,
 	// built only to publish), so it is installed from npm
-	b, err := fetchNPM(pc, pj.Name, "/"+npmPath(pj.Name)+"/latest", 1<<20)
+	b, err := fetchNPMFrom(pc, registry, pj.Name, "/"+npmPath(pj.Name)+"/latest", 1<<20)
 	known := err == nil || errors.Is(err, errNotFound)
 	var unknown error
 	if !known {
@@ -654,9 +668,9 @@ func githubRepo(spec string) string {
 // askListOrGitHub is the list the community repo's workflow built (see
 // catalog.go) when it can be had, else GitHub's own answer, as askTagged
 // gives it. GitHub's error is the one reported when neither answers.
-func askListOrGitHub(ctx context.Context, last []Tagged) ([]Tagged, bool, *TaggedMissing, error) {
+func askListOrGitHub(ctx context.Context, registry RegistryInUse, last []Tagged) ([]Tagged, bool, *TaggedMissing, error) {
 	if l, err := askCatalog(ctx); err == nil {
 		return l, true, nil, nil
 	}
-	return askTagged(ctx, last)
+	return askTagged(ctx, registry, last)
 }

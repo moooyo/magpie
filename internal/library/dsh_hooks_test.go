@@ -18,7 +18,7 @@ func fakeDshPlugins(t *testing.T, ver string, fail error) *[][]string {
 	var runs [][]string
 	was, wasRun := dshTool, dshPluginRun
 	dshTool = func(*agent.Agent) (string, string) { return ver, "dsh" }
-	dshPluginRun = func(bin, dir, cwd string, args ...string) (string, error) {
+	dshPluginRun = func(bin, dir, cwd, registry string, args ...string) (string, error) {
 		runs = append(runs, append([]string{cwd}, args...))
 		if fail != nil {
 			return "", fail
@@ -119,6 +119,39 @@ func TestHooksDshNeedsItsPlugin(t *testing.T) {
 	}
 	if s := read(t, web); strings.Contains(s, "id: magpie-hooks\n") {
 		t.Fatalf("a row for a plugin that isn't there:\n%s", s)
+	}
+}
+
+func TestHooksDshRetriesOnRegistryChange(t *testing.T) {
+	h := sandbox(t)
+	dir := filepath.Join(h, ".dsh")
+	write(t, filepath.Join(dir, "profiles", "web", "cordis.patch.yml"), "[]\n")
+	fakeDshPlugins(t, "0.2.2-rc.5", errors.New("registry not available"))
+	run := dshPluginRun
+	var registries []string
+	dshPluginRun = func(bin, home, cwd, registry string, args ...string) (string, error) {
+		registries = append(registries, registry)
+		return run(bin, home, cwd, registry, args...)
+	}
+	target := &Target{Agent: &agent.Agent{Dir: dir}}
+	apply := func() error {
+		return dshHooksPlugin(target, "magpie-hooks.json", true, func(string) error { return nil })
+	}
+	const old = "https://old.example.test/npm"
+	setLibraryNPMUpstream(t, old)
+	if err := apply(); err == nil || !strings.Contains(err.Error(), "registry not available") {
+		t.Fatalf("first attempt = %v", err)
+	}
+	if err := apply(); err == nil || !strings.Contains(err.Error(), "trying again later") {
+		t.Fatalf("retry at the same registry = %v", err)
+	}
+	const next = "https://new.example.test/npm"
+	setLibraryNPMUpstream(t, next)
+	if err := apply(); err == nil || !strings.Contains(err.Error(), "registry not available") {
+		t.Fatalf("attempt after registry change = %v", err)
+	}
+	if len(registries) != 2 || registries[0] != old || registries[1] != next {
+		t.Errorf("registry passed to dsh's installer = %v", registries)
 	}
 }
 

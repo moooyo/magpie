@@ -21,6 +21,7 @@ import (
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/settingsapi"
 )
 
 // OpenCode's provider plugins (internal/plugin): the providers they sign
@@ -786,7 +787,7 @@ func pluginRoutes(mux *http.ServeMux, w Windows) {
 			fail(rw, err)
 			return
 		}
-		if _, err := plugin.SetRegistry(in.URL); err != nil {
+		if _, err := settingsapi.SetPluginRegistry(in.URL); err != nil {
 			fail(rw, err)
 			return
 		}
@@ -943,18 +944,11 @@ func pluginProviderByID(id string) (plugin.Provider, bool) {
 // setChinaMirror turns the 「国内镜像」 switch on or off; a plugin list
 // fetched from GitHub's slow address, or not at all, is asked again.
 func setChinaMirror(on bool) error {
-	s := settings.Load()
-	if s.ChinaMirror == on {
-		return nil
-	}
-	s.ChinaMirror = on
-	if err := settings.Save(s); err != nil {
-		return err
-	}
-	if on {
+	changed, err := settings.SetChinaMirror(on)
+	if changed && on {
 		plugin.RefreshMarket()
 	}
-	return nil
+	return err
 }
 
 // pluginAgentJSON is the agent a plugin adds, as its row says it.

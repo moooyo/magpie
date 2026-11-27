@@ -23,6 +23,7 @@ import (
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/mcpauth"
 	"github.com/yetone/magpie/internal/netproxy"
+	"github.com/yetone/magpie/internal/npmregistry"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/wslrun"
@@ -137,7 +138,7 @@ type checkedServer struct {
 	h   ServerHealth
 }
 
-func healthKey(s *Server, own ownSignIns) string {
+func healthKey(s *Server, own ownSignIns, registry string) string {
 	c := *s
 	c.Name, c.Agents = "", nil
 	b, _ := json.Marshal(c)
@@ -154,7 +155,7 @@ func healthKey(s *Server, own ownSignIns) string {
 	// and the agents signed in to it themselves: one signed in since
 	// isn't left as "needs sign-in"
 	// and the renewal wait: checked again once it is over
-	return fmt.Sprintf("%s|%v|%v|%d|%d|%v|%q|%q", b, st.SignedIn, st.Dead, st.At, st.RetryAt, st.RetryUnavailable, sides, own.of(s))
+	return fmt.Sprintf("%s|%v|%v|%d|%d|%v|%q|%q|%q", b, st.SignedIn, st.Dead, st.At, st.RetryAt, st.RetryUnavailable, sides, own.of(s), hostMCPRegistry(s, registry))
 }
 
 // CheckServers checks the library's servers called names (every one when
@@ -178,12 +179,13 @@ func CheckServers(ctx context.Context, names []string, fresh bool) (map[string]S
 		}
 	}
 	own := readOwnSignIns()
+	registry := npmregistry.Configured()
 	out := map[string]ServerHealth{}
 	var outMu sync.Mutex
 	var wg sync.WaitGroup
 	slots := make(chan struct{}, checkAtOnce)
 	for _, s := range list {
-		key := healthKey(s, own)
+		key := healthKey(s, own, registry)
 		checked.Lock()
 		c, ok := checked.m[s.Name]
 		checked.Unlock()
@@ -198,10 +200,10 @@ func CheckServers(ctx context.Context, names []string, fresh bool) (map[string]S
 			defer wg.Done()
 			slots <- struct{}{}
 			defer func() { <-slots }()
-			h := checkServer(ctx, s, own)
+			h := checkServer(ctx, s, own, registry)
 			// as the server is now: a sign-in the check found run out
 			// isn't one to check it again for
-			key := healthKey(s, own)
+			key := healthKey(s, own, registry)
 			// a check cut short by the page going away isn't one, and a
 			// server that didn't answer in time is asked again next time:
 			// a slow server may answer then (#1467)
@@ -226,13 +228,12 @@ func CheckServers(ctx context.Context, names []string, fresh bool) (map[string]S
 
 // CheckServer connects to one server and asks it for its tools.
 func CheckServer(ctx context.Context, s *Server) ServerHealth {
-	return checkServer(ctx, s, nil)
+	return checkServer(ctx, s, nil, npmregistry.Configured())
 }
 
-// checkServer is CheckServer with the agents' own sign-ins read already,
-// once for every server checked together; nil reads them when a server
-// asks for a sign-in.
-func checkServer(ctx context.Context, s *Server, own ownSignIns) ServerHealth {
+// checkServer uses the npm upstream and the agents' own sign-ins read
+// for the whole batch. Nil own reads them when a server needs a sign-in.
+func checkServer(ctx context.Context, s *Server, own ownSignIns, registry string) ServerHealth {
 	each := remoteStep
 	if s.Transport == "stdio" {
 		each = stdioStep
@@ -245,7 +246,7 @@ func checkServer(ctx context.Context, s *Server, own ownSignIns) ServerHealth {
 	var h ServerHealth
 	switch s.Transport {
 	case "stdio":
-		h = checkStdio(ctx, s)
+		h = checkStdioAtRegistry(ctx, s, registry)
 	case "sse":
 		h = checkSSE(ctx, s)
 	default:
@@ -498,9 +499,13 @@ func (t *tail) last() string {
 // checkStdio starts the command where the agents given it start it
 // (checkSides), each place in turn; the first failure is the answer.
 func checkStdio(ctx context.Context, s *Server) ServerHealth {
+	return checkStdioAtRegistry(ctx, s, npmregistry.Configured())
+}
+
+func checkStdioAtRegistry(ctx context.Context, s *Server, registry string) ServerHealth {
 	sides := checkSides(s)
 	if len(sides) == 1 && sides[0] == "" {
-		return checkStdioAt(ctx, s, "")
+		return checkStdioAt(ctx, s, "", registry)
 	}
 	var done, down []string
 	var first *ServerHealth
@@ -508,7 +513,7 @@ func checkStdio(ctx context.Context, s *Server) ServerHealth {
 		if len(done) > 0 {
 			stepTo(ctx, "initialize")
 		}
-		h := checkStdioAt(ctx, s, d)
+		h := checkStdioAt(ctx, s, d, registry)
 		if h.Why == "wsldown" {
 			down = append(down, d)
 			continue
@@ -572,11 +577,12 @@ func withPath(env []string, dir string) []string {
 // MCP connection; what it writes to stderr is kept in errs; stop ends a
 // run in a distro (call it beside tree.Kill). The check starts it so, and
 // so does the hub (mcp_hub.go), on this machine.
-func startServer(ctx context.Context, s *Server, distro, dir string) (tree *proc.Tree, stdin io.WriteCloser, stdout io.ReadCloser, errs *tail, stop func(), bad *ServerHealth) {
+func startServer(ctx context.Context, s *Server, distro, dir, registry string) (tree *proc.Tree, stdin io.WriteCloser, stdout io.ReadCloser, errs *tail, stop func(), bad *ServerHealth) {
 	fail := func(h ServerHealth) (*proc.Tree, io.WriteCloser, io.ReadCloser, *tail, func(), *ServerHealth) {
 		return nil, nil, nil, nil, nil, &h
 	}
 	command, args, own := launchCmd(s, distro)
+	registry = npmRegistryFor(registry, command, args, own)
 	env, unset := expandAll(own)
 	if len(unset) > 0 {
 		return fail(failed("novar", strings.Join(unset, ", ")))
@@ -605,6 +611,7 @@ func startServer(ctx context.Context, s *Server, distro, dir string) (tree *proc
 		// check's, whose timeout is told as one rather than as an exit
 		var rctx context.Context
 		rctx, stop = context.WithCancel(context.WithoutCancel(ctx))
+		t, args = wslRegistry(t, args, registry)
 		cmd = wslCommand(rctx, t, args...)
 	}
 	// Agents start MCP servers from a project or home directory. A magpie
@@ -612,6 +619,9 @@ func startServer(ctx context.Context, s *Server, distro, dir string) (tree *proc
 	// as its own cwd, which is not writable; inherit that and a server that
 	// writes into "." dies as "exited (1)" with no log. Pin the check to HOME.
 	cmd.Env = os.Environ()
+	if distro == "" {
+		cmd.Env = npmregistry.WithEnv(cmd.Env, registry)
+	}
 	d := dir
 	if d == "" || distro != "" {
 		d = home()
@@ -628,16 +638,11 @@ func startServer(ctx context.Context, s *Server, distro, dir string) (tree *proc
 	if found != "" {
 		cmd.Env = withPath(cmd.Env, found)
 	}
-	var names []string
-	for k, v := range env {
-		cmd.Env = append(cmd.Env, k+"="+v)
-		names = append(names, k)
-	}
+	cmd.Env = withMCPEnv(cmd.Env, env, npmregistry.Program(command))
 	if distro != "" {
 		// a run in the distro is given the server's own variables, by
 		// WSLENV, and none of Windows' others
-		slices.Sort(names)
-		cmd.Env = t.Env(cmd.Env, names...)
+		cmd.Env = t.Env(cmd.Env, wslOwnNames(cmd.Env, env)...)
 	}
 	in, err := cmd.StdinPipe()
 	if err != nil {
@@ -665,10 +670,10 @@ func startServer(ctx context.Context, s *Server, distro, dir string) (tree *proc
 
 // checkStdioAt starts the command on this machine, or in WSL distro, and
 // asks it for its tools.
-func checkStdioAt(ctx context.Context, s *Server, distro string) ServerHealth {
-	h := checkStdioIn(ctx, s, distro, "")
+func checkStdioAt(ctx context.Context, s *Server, distro, registry string) ServerHealth {
+	h := checkStdioIn(ctx, s, distro, "", registry)
 	if distro == "" && h.Why == "exited" {
-		return inProject(ctx, s, h)
+		return inProject(ctx, s, h, registry)
 	}
 	return h
 }
@@ -681,14 +686,14 @@ func checkStdioAt(ctx context.Context, s *Server, distro string) ServerHealth {
 // for every agent that starts it itself. Run by magpie, in home (the MCP
 // router, or Codex on magpie: mcp_run.go), it doesn't, and the page says
 // to keep it direct. A server that exits in the project folder too is h.
-func inProject(ctx context.Context, s *Server, h ServerHealth) ServerHealth {
+func inProject(ctx context.Context, s *Server, h ServerHealth, registry string) ServerHealth {
 	dir, err := os.MkdirTemp("", "magpie-mcp-project-")
 	if err != nil {
 		return h
 	}
 	defer os.RemoveAll(dir)
 	stepTo(ctx, "initialize")
-	p := checkStdioIn(ctx, s, "", dir)
+	p := checkStdioIn(ctx, s, "", dir, registry)
 	if p.State != "ok" {
 		return h
 	}
@@ -722,8 +727,8 @@ func inHome(s *Server) bool {
 
 // checkStdioIn is checkStdioAt with the command started in dir ("" for
 // home).
-func checkStdioIn(ctx context.Context, s *Server, distro, dir string) ServerHealth {
-	tree, stdin, stdout, errs, stop, bad := startServer(ctx, s, distro, dir)
+func checkStdioIn(ctx context.Context, s *Server, distro, dir, registry string) ServerHealth {
+	tree, stdin, stdout, errs, stop, bad := startServer(ctx, s, distro, dir, registry)
 	if bad != nil {
 		return *bad
 	}

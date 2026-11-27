@@ -417,6 +417,6 @@ var bunCommand = func(ctx context.Context, bun, dir string, args ...string) *exe
 	}
 	cmd.Env = append(netproxy.EnvForBun(e), "BUN_INSTALL_CACHE_DIR="+installCacheDir())
 	cmd.Env = append(cmd.Env, caEnv(cmd.Env, dir)...)
-	cmd.Env = append(cmd.Env, registryEnv(cmd.Env)...)
+	cmd.Env = registryEnv(ctx, cmd.Env)
 	return cmd
 }

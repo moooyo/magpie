@@ -30,6 +30,7 @@ import (
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/netproxy"
+	"github.com/yetone/magpie/internal/npmregistry"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/steady"
@@ -501,6 +502,8 @@ type host struct {
 	// with magpie's now (proxyMoved), zero for a host not started here.
 	proxy   string
 	proxyAt time.Time
+	// upstream is the explicit npm upstream used when starting the host.
+	upstream string
 	// addr is the gateway's address the host was told (hostAddr)
 	addr string
 	// output is the child's stdout and stderr, read apart from its Wait,
@@ -1035,7 +1038,7 @@ func getLocked(ctx context.Context) (*host, error) {
 		go current.retire()
 		current = nil
 	}
-	if current != nil && current.alive() && current.proxyMoved() {
+	if current != nil && current.alive() && (current.upstream != npmregistry.Configured() || current.proxyMoved()) {
 		go current.retire()
 		current = nil
 	}
@@ -1146,8 +1149,9 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 		}()
 	}
 	// the host outlives the request that started it
+	registry := Registry()
 	proxy := hostProxy(env()) // what bunCommand gives it
-	cmd := bunCommand(context.Background(), bun, settings.Dir(), "run", "--preload", opens, js)
+	cmd := bunCommand(withRegistry(context.Background(), registry), bun, settings.Dir(), "run", "--preload", opens, js)
 	addr := hostAddr(cmd.Env)
 	log.Printf("plugin: host starts with %s", netLine(cmd.Env))
 	cmd.Env = hostEnv(cmd.Env)
@@ -1191,6 +1195,7 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 		cancel:   hcancel,
 		proxy:    proxy,
 		proxyAt:  time.Now(),
+		upstream: registry.upstream(),
 		addr:     addr,
 		output:   output,
 		waited:   waited,

@@ -52,6 +52,7 @@ import (
 	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/mcpauth"
+	"github.com/yetone/magpie/internal/npmregistry"
 )
 
 func init() { gateway.MCPHub = theHub{} }
@@ -355,19 +356,21 @@ func (theHub) Tools(ctx context.Context, agentID string) []gateway.HubTool {
 			defer wg.Done()
 			var ts []map[string]json.RawMessage
 			var says serverSays
+			var key string
 			var err error
 			if s.Plugin != "" {
 				ts, err = pluginHubTools(ctx, s)
+				key = hubKey(s)
 			} else {
 				b := backendOf(s)
 				ts, err = b.tools(ctx)
-				says = b.said()
+				says, key = b.said(), b.key
 			}
 			if err != nil {
 				return
 			}
 			listed[i] = true
-			noteCard(s, says, ts)
+			noteCard(s, key, says, ts)
 			for _, t := range ts {
 				var name string
 				if json.Unmarshal(t["name"], &name) != nil || name == "" || slices.Contains(s.DisabledTools, name) {
@@ -480,9 +483,10 @@ func hubPrune() {
 	}
 	given := map[string]string{}
 	if l.MCPHub {
+		registry := npmregistry.Configured()
 		for _, s := range l.MCP {
 			if inHub(s, "") {
-				given[s.Name] = hubKey(s)
+				given[s.Name] = hubKeyAt(s, hostMCPRegistry(s, registry))
 			}
 		}
 	}
@@ -508,19 +512,35 @@ var hubPool = struct {
 	m map[string]*backend
 }{m: map[string]*backend{}}
 
-// hubKey is the server as it is run: an edit, or a sign-in since, is
-// another to start.
-func hubKey(s *Server) string {
+// hubRegistry is the configured upstream only for a package manager the
+// hub starts without a registry of its own.
+func hubRegistry(s *Server) string {
+	if s.Transport != "stdio" {
+		return ""
+	}
+	return hostMCPRegistry(s, npmregistry.Configured())
+}
+
+// hubKey is the server as it is run: an edit, a sign-in since or a change
+// to its npm upstream is another to start.
+func hubKey(s *Server) string { return hubKeyAt(s, hubRegistry(s)) }
+
+func hubKeyAt(s *Server, registry string) string {
 	c := *s.live()
 	c.Agents, c.DisabledTools, c.Accounts, c.Account = nil, nil, nil, ""
 	b, _ := json.Marshal(c)
 	// the sign-in in use too: another account is another to start
 	in := s.Transport == "http" && mcpauth.SignedIn(s.Name, s.URL)
-	return fmt.Sprintf("%s|%v|%s", b, in, map[bool]string{true: mcpauth.InUse(s.Name)}[in])
+	key := fmt.Sprintf("%s|%v|%s", b, in, map[bool]string{true: mcpauth.InUse(s.Name)}[in])
+	if registry != "" {
+		key += "|npm:" + registry
+	}
+	return key
 }
 
 func backendOf(s *Server) *backend {
-	key := hubKey(s)
+	registry := hubRegistry(s)
+	key := hubKeyAt(s, registry)
 	hubPool.Lock()
 	defer hubPool.Unlock()
 	b := hubPool.m[s.Name]
@@ -530,7 +550,7 @@ func backendOf(s *Server) *backend {
 	}
 	if b == nil {
 		c := *s
-		b = &backend{s: &c, key: key, router: isRouter(&c)}
+		b = &backend{s: &c, key: key, registry: registry, router: isRouter(&c)}
 		hubPool.m[s.Name] = b
 	}
 	return b
@@ -562,8 +582,9 @@ type hubConn interface {
 // backend is one server the hub uses: its connection while it has one,
 // and the tools it last listed.
 type backend struct {
-	s   *Server
-	key string
+	s        *Server
+	key      string
+	registry string // the upstream snapshotted with key
 
 	mu      sync.Mutex
 	conn    hubConn
@@ -630,7 +651,7 @@ func (b *backend) start(ready chan struct{}) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), each)
 	defer cancel()
-	c, err := dialHub(ctx, b.s, b.changed)
+	c, err := dialHub(ctx, b.s, b.changed, b.registry)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.stopped && c != nil {
@@ -865,14 +886,14 @@ func healthErr(h ServerHealth) error {
 	return errors.New(s)
 }
 
-// dialHub connects to s, initialized, for the hub; changed is called when
-// it says its tools changed.
-func dialHub(ctx context.Context, s *Server, changed func()) (hubConn, error) {
+// dialHub connects to s for the hub with the backend's upstream;
+// changed is called when it says its tools changed.
+func dialHub(ctx context.Context, s *Server, changed func(), registry string) (hubConn, error) {
 	var c *streamConn
 	var err error
 	switch s.Transport {
 	case "stdio":
-		c, err = dialStdio(s, changed)
+		c, err = dialStdio(s, changed, registry)
 	case "sse":
 		c, err = dialSSE(ctx, s, changed)
 	default:
@@ -1090,9 +1111,9 @@ func (c *streamConn) close() {
 }
 
 // dialStdio starts the command s runs, as the check starts it.
-func dialStdio(s *Server, changed func()) (*streamConn, error) {
+func dialStdio(s *Server, changed func(), registry string) (*streamConn, error) {
 	// the hub's server lives until the hub ends it, not with a request
-	tree, stdin, stdout, errs, stop, bad := startServer(context.Background(), s, "", "")
+	tree, stdin, stdout, errs, stop, bad := startServer(context.Background(), s, "", "", registry)
 	if bad != nil {
 		return nil, healthErr(*bad)
 	}

@@ -1117,11 +1117,9 @@ type Settings struct {
 	// downloads are asked of mirrors in China first, and of their official
 	// addresses after (see source.China).
 	ChinaMirror bool `json:"chinaMirror,omitempty"`
-	// NPMRegistry is the npm registry set on the Plugins page or with
-	// `magpie plugin registry`: plugins are installed from it and npm's
-	// answers asked of it, before a registry the user's .npmrc, bunfig or
-	// shell names and before the 「国内镜像」 switch (plugin.Registry).
-	// "" leaves it to those.
+	// NPMRegistry is Magpie's explicit npm upstream for lookups and the
+	// package managers it starts. An empty value leaves their default
+	// registry and mirror selection in place.
 	NPMRegistry string `json:"npmRegistry,omitempty"`
 	// TextSize is how large the window's and the tray panel's pages are
 	// drawn, in percent (one of TextSizes): the webviews' own zoom, as a
@@ -2446,6 +2444,46 @@ func SavedAddr() string {
 func Save(s Settings) error {
 	defer lockFile()()
 	return save(s, false)
+}
+
+// SavePrefs saves the settings editor's choices. An editor that did not
+// send the upstream must keep the current one, not the one its earlier
+// read saw. Return that current value to decide whether to resync MCP.
+func SavePrefs(s *Settings, writeRegistry bool) (string, error) {
+	defer lockFile()()
+	cur, err := loadChecked()
+	if err != nil {
+		return "", err
+	}
+	if !writeRegistry {
+		s.NPMRegistry = cur.NPMRegistry
+	}
+	return cur.NPMRegistry, save(*s, false)
+}
+
+// SetChinaMirror saves the mirror switch from the current settings file.
+func SetChinaMirror(on bool) (bool, error) {
+	defer lockFile()()
+	s, err := loadChecked()
+	if err != nil || s.ChinaMirror == on {
+		return false, err
+	}
+	s.ChinaMirror = on
+	err = save(s, false)
+	return err == nil, err
+}
+
+// SetNPMRegistry changes just the upstream without overwriting any other
+// setting saved since the plugin editor read the file.
+func SetNPMRegistry(registry string) (changed bool, err error) {
+	defer lockFile()()
+	s, err := loadChecked()
+	if err != nil || s.NPMRegistry == registry {
+		return false, err
+	}
+	s.NPMRegistry = registry
+	err = save(s, false)
+	return err == nil, err
 }
 
 // SessionReads is the user's answer to which agents' session files magpie

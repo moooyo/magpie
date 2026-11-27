@@ -42,7 +42,7 @@ func TestTaggedPageWithMain(t *testing.T) {
 	t.Cleanup(func() { githubAPI, githubRaw, npmRegistry = api, raw, reg })
 
 	const repo = "xiaopeng66/magpie-model-lab"
-	got, keep, known, err := readTagged(context.Background(), Tagged{Spec: "github:" + repo, Repo: repo}, "main")
+	got, keep, known, err := readTagged(context.Background(), Registry(), Tagged{Spec: "github:" + repo, Repo: repo}, "main")
 	if !keep || !known || err != nil || got.Kind != "page" || got.Package != "magpie-pelican-bench" {
 		t.Fatalf("a page with a main: kind %q, package %q, kept %v, known %v, %v", got.Kind, got.Package, keep, known, err)
 	}
@@ -53,13 +53,13 @@ func TestTaggedPageWithMain(t *testing.T) {
 		t.Fatalf("its main wasn't looked for: asked %v", a)
 	}
 
-	got, keep, _, err = readTagged(context.Background(), Tagged{Spec: "github:someone/provider-with-page", Repo: "someone/provider-with-page"}, "main")
+	got, keep, _, err = readTagged(context.Background(), Registry(), Tagged{Spec: "github:someone/provider-with-page", Repo: "someone/provider-with-page"}, "main")
 	if !keep || err != nil || got.Kind == "page" {
 		t.Fatalf("a provider with a settings page: kind %q, kept %v, %v", got.Kind, keep, err)
 	}
 
 	// a page alone, no main, as before
-	got, keep, _, err = readTagged(context.Background(), Tagged{Spec: "github:someone/page-glance", Repo: "someone/page-glance"}, "main")
+	got, keep, _, err = readTagged(context.Background(), Registry(), Tagged{Spec: "github:someone/page-glance", Repo: "someone/page-glance"}, "main")
 	if !keep || err != nil || got.Kind != "page" {
 		t.Fatalf("a page alone: %+v, kept %v, %v", got, keep, err)
 	}

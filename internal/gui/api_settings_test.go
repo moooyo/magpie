@@ -1,6 +1,7 @@
 package gui
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -8,7 +9,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 func TestSettingsSearchProviderOff(t *testing.T) {
@@ -28,6 +31,48 @@ func TestSettingsSearchProviderOff(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/api/settings", strings.NewReader(`{"searcher":"missing-provider"}`)))
 	if rec.Code != http.StatusBadRequest || settings.Load().Searcher != "off" {
 		t.Fatalf("invalid provider changed the choice: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestSettingsAndPluginsShareNPMRegistry(t *testing.T) {
+	root := t.TempDir()
+	testenv.SetHome(t, root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, ".config"))
+	t.Setenv("APPDATA", filepath.Join(root, "AppData", "Roaming"))
+	t.Setenv("BUN_CONFIG_REGISTRY", "https://automatic.example/npm")
+	h := Handler(nil, nil)
+	request := func(method, path, body string, want int) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(method, path, strings.NewReader(body)))
+		if rec.Code != want {
+			t.Fatalf("%s %s: %d %s", method, path, rec.Code, rec.Body)
+		}
+		return rec
+	}
+	check := func(rec *httptest.ResponseRecorder, want string) {
+		t.Helper()
+		var got settings.Settings
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil || got.NPMRegistry != want {
+			t.Fatalf("registry in Settings response = %q, %v; want %q", got.NPMRegistry, err, want)
+		}
+	}
+	const custom = "https://npm.example/repo"
+	check(request("POST", "/api/settings", `{"npmRegistry":" https://npm.example/repo/ "}`, http.StatusOK), custom)
+	check(request("POST", "/api/settings", `{"theme":"dark"}`, http.StatusOK), custom)
+	if got := plugin.Registry(); got.From != plugin.FromMagpie || got.URL != custom {
+		t.Fatalf("Plugins did not follow the Settings choice: %+v", got)
+	}
+	bad := request("POST", "/api/settings", `{"npmRegistry":"https://user:private@npm.example"}`, http.StatusBadRequest)
+	if strings.Contains(bad.Body.String(), "private") {
+		t.Fatal("a refused registry exposed its credentials")
+	}
+	check(request("GET", "/api/settings", "", http.StatusOK), custom)
+	request("POST", "/api/plugins/registry", `{"url":"http://127.0.0.1:8765/npm/"}`, http.StatusOK)
+	check(request("GET", "/api/settings", "", http.StatusOK), "http://127.0.0.1:8765/npm")
+	check(request("POST", "/api/settings", `{"npmRegistry":""}`, http.StatusOK), "")
+	if got := plugin.Registry(); got.From != plugin.FromEnv || got.URL != "https://automatic.example/npm" {
+		t.Errorf("clearing the explicit registry did not restore automatic selection: %+v", got)
 	}
 }
 

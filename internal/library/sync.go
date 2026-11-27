@@ -7,9 +7,11 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/mcpauth"
+	"github.com/yetone/magpie/internal/npmregistry"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -97,7 +99,7 @@ func (l *Library) sync() *Result {
 		b = newBackups()
 	}
 	all := Targets()
-	for _, step := range syncSteps(all, l.held(all), b, res) {
+	for _, step := range syncSteps(all, l.held(all), b, res, npmregistry.Configured()) {
 		step(l)
 	}
 	res.Backup = b.dir
@@ -108,31 +110,64 @@ func (l *Library) sync() *Result {
 	return res
 }
 
+// registrySync orders a settings refresh after any whole sync that is
+// already writing entries from an earlier registry snapshot. Library
+// edits still take mu alone, and may run between the whole sync's steps.
+var registrySync sync.RWMutex
+
+// SyncMCP reapplies the Library's managed MCP entries after a setting
+// changes how they are started, without resyncing skills or instructions.
+func SyncMCP() (*Result, error) {
+	registrySync.Lock()
+	res, err := syncManagedMCP()
+	registrySync.Unlock()
+	if res != nil && len(res.dropped) > 0 {
+		ending(res.dropped)
+	}
+	return res, err
+}
+
+func syncManagedMCP() (*Result, error) {
+	mu.Lock()
+	defer mu.Unlock()
+	l, err := load()
+	if err != nil {
+		return nil, err
+	}
+	res := l.syncMCPOnly(true)
+	return res, l.save()
+}
+
 // syncMCPOnly is sync for a change to the MCP servers alone (changeMCP):
 // each agent's MCP files, a gone one's too, and the projects', which can
 // name the servers; nothing of the skills, instructions or the rest, which
 // the change left as they were.
-func (l *Library) syncMCPOnly() *Result {
+func (l *Library) syncMCPOnly(registryOnly bool) *Result {
 	res := &Result{Changed: []string{}, Problems: []Problem{}, mcpOnly: true}
 	b := l.kept
 	if b == nil {
 		b = newBackups()
 	}
 	all := Targets()
+	registry := npmregistry.Configured()
 	for _, t := range all {
 		func() {
 			if claudeCode(t) {
 				defer l.claudeAside()()
 			}
 			l.cindyLeftovers(t, b, res)
-			l.syncMCP(t, b, res)
+			l.syncMCP(t, b, res, registry)
 		}()
 	}
 	for _, t := range l.held(all) {
 		l.cindyLeftovers(t, b, res)
-		l.syncMCP(t, b, res)
+		l.syncMCP(t, b, res, registry)
 	}
-	l.syncProjects(res)
+	if registryOnly {
+		l.syncProjectRegistries(res)
+	} else {
+		l.syncProjects(res)
+	}
 	res.Backup = b.dir
 	if b.dir != "" {
 		pruneBackups()
@@ -169,7 +204,7 @@ func (r *Result) Standing(was []Problem) []Problem {
 // syncSteps are what a sync does, one agent's part at a time, in order. The
 // agents gone from here that still have what magpie gave them (held) only
 // have what was unticked taken out, after the rest.
-func syncSteps(all, gone []*Target, b *backups, res *Result) []func(*Library) {
+func syncSteps(all, gone []*Target, b *backups, res *Result, registry string) []func(*Library) {
 	// a skill whose app moved it is followed first, for every agent to
 	// get the moved one (skill_moved.go)
 	// an edit made in a subagent's own file too (subagent_file.go)
@@ -183,7 +218,7 @@ func syncSteps(all, gone []*Target, b *backups, res *Result) []func(*Library) {
 			}
 			l.syncInstructions(t, all, b, res, true)
 			l.cindyLeftovers(t, b, res)
-			l.syncMCP(t, b, res)
+			l.syncMCP(t, b, res, registry)
 			l.syncHooks(t, b, res)
 			l.syncEnv(t, b, res)
 			l.syncSubagents(t, b, res)
@@ -198,7 +233,7 @@ func syncSteps(all, gone []*Target, b *backups, res *Result) []func(*Library) {
 	for _, t := range gone {
 		steps = append(steps, func(l *Library) {
 			l.cindyLeftovers(t, b, res)
-			l.syncMCP(t, b, res)
+			l.syncMCP(t, b, res, registry)
 			l.syncHooks(t, b, res)
 			l.syncEnv(t, b, res)
 			l.syncSkills(t, res, all)
@@ -238,6 +273,8 @@ func syncSteps(all, gone []*Target, b *backups, res *Result) []func(*Library) {
 // first operations after opening magpie took seconds (#1624, Hipple).
 // It lets go after each agent's part, for whatever waits to go first.
 func Sync() (*Result, error) {
+	registrySync.RLock()
+	defer registrySync.RUnlock()
 	// a plugin's tools, a server of their own (plugin_tools.go)
 	if _, err := adoptPluginTools(); err != nil {
 		log.Printf("library: giving plugin tools a server: %v", err)
@@ -268,10 +305,14 @@ func Sync() (*Result, error) {
 	}
 	// the agents are found under the lock, as a change finds them
 	var npxDirs map[string]bool
-	if err := step(func(l *Library) { all = Targets(); gone = l.held(all); npxDirs = l.npxDirs() }); err != nil {
+	var registry string
+	if err := step(func(l *Library) {
+		all, registry = Targets(), npmregistry.Configured()
+		gone, npxDirs = l.held(all), l.npxDirs(registry)
+	}); err != nil {
 		return nil, err
 	}
-	for _, f := range syncSteps(all, gone, b, res) {
+	for _, f := range syncSteps(all, gone, b, res, registry) {
 		if err := step(f); err != nil {
 			return nil, err
 		}
@@ -290,7 +331,7 @@ func Sync() (*Result, error) {
 	return res, nil
 }
 
-func (l *Library) syncMCP(t *Target, b *backups, res *Result) {
+func (l *Library) syncMCP(t *Target, b *backups, res *Result, registry string) {
 	if res.unreached(t) {
 		return
 	}
@@ -415,20 +456,20 @@ func (l *Library) syncMCP(t *Target, b *backups, res *Result) {
 			continue
 		}
 		s, _ = t.MCP.side(s)
-		if !t.MCP.WSL {
-			s = npxDirect(s)
-		}
 		// a server the user keeps direct is started by Codex itself, in
 		// the thread's folder (#4382): magpie would start it from home
 		if run && s.Hub != HubDirect {
-			if via, spec, ok := runVia(s, base); ok {
+			if via, spec, ok := runVia(s, base, registry); ok {
 				if res.run == nil {
 					res.run = map[string]runSpec{}
 				}
 				s, res.run[s.Name] = via, spec
 			}
 		}
-		s = t.MCP.withCmdVars(s)
+		if !t.MCP.WSL {
+			s = npxDirect(s, registry)
+		}
+		s = t.MCP.withCmdVars(withNPMRegistry(s, registry, t.MCP.WSL))
 		s = wroteStartup(s, a.Startup[s.Name])
 		old := entries[s.Name]
 		if err := t.MCP.foreign(old); err != nil {

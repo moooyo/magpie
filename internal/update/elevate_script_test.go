@@ -10,9 +10,10 @@ import (
 // process starts from the user's environment afresh; it keeps cmd.exe from
 // reading a % as a variable, and passes npm's exit code on.
 func TestElevatedScript(t *testing.T) {
-	own := []string{"PATH=C:\\Windows", "USERPROFILE=C:\\Users\\me", "=C:=C:\\"}
+	const registry = "NPM_CONFIG_REGISTRY=https://npm.example/repo%20one/"
+	own := []string{"PATH=C:\\Windows", "USERPROFILE=C:\\Users\\me", "=C:=C:\\", registry}
 	env := []string{"PATH=C:\\Program Files\\nodejs;C:\\Windows", "USERPROFILE=C:\\Users\\me", "=C:=C:\\",
-		"HTTPS_PROXY=http://127.0.0.1:7890", "WEIRD=50%off", "BAD=a\"b", "NONINTERACTIVE=1"}
+		"HTTPS_PROXY=http://127.0.0.1:7890", "WEIRD=50%off", "BAD=a\"b", "NONINTERACTIVE=1", registry}
 	got, err := elevatedScript(`C:\Users\me`, env, own, `C:\Temp\x\out.log`,
 		[]string{`C:\Program Files\nodejs\npm.cmd`, "install", "-g", "--prefix", `C:\Program Files\nodejs`, "@google/gemini-cli@latest"})
 	if err != nil {
@@ -23,6 +24,7 @@ func TestElevatedScript(t *testing.T) {
 		"set \"HTTPS_PROXY=http://127.0.0.1:7890\"\r\n",
 		"set \"WEIRD=50%%off\"\r\n",
 		"set \"NONINTERACTIVE=1\"\r\n",
+		"set \"NPM_CONFIG_REGISTRY=https://npm.example/repo%%20one/\"\r\n",
 		"cd /d \"C:\\Users\\me\"\r\n",
 		`call "C:\Program Files\nodejs\npm.cmd" "install" "-g" "--prefix" "C:\Program Files\nodejs" "@google/gemini-cli@latest" > "C:\Temp\x\out.log" 2>&1` + "\r\n",
 		"exit /b %errorlevel%\r\n",

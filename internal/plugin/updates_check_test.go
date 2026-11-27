@@ -57,7 +57,7 @@ func TestCheckNow(t *testing.T) {
 	// what npm said within the hour, before the new versions came out
 	npmMu.Lock()
 	for _, p := range []string{ours, theirs} {
-		npmCached()[p] = npmEntry{NPM{Version: "0.1.2"}, time.Now().Add(-time.Minute)}
+		npmCached()[p] = npmEntry{Info: NPM{Version: "0.1.2"}, At: time.Now().Add(-time.Minute)}
 	}
 	npmMu.Unlock()
 	was := installNewest

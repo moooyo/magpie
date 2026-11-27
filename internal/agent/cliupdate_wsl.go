@@ -12,6 +12,8 @@ import (
 	"path"
 	"strings"
 	"time"
+
+	"github.com/yetone/magpie/internal/npmregistry"
 )
 
 // wslProbes keeps what a distro said of a CLI (wslCLIScript's output); a
@@ -29,7 +31,8 @@ echo "real:$r"
 # wsl.exe -e has no login PATH: a node CLI finds its node beside it, in its
 # npm prefix, or where a user's tools are
 PATH="$(dirname "$b"):${r%%/lib/node_modules/*}/bin:$HOME/.local/bin:$HOME/.bun/bin:$PATH"
-o=$("$b" --version 2>&1 </dev/null); c=$?
+# Cline can schedule an npm install even on --version.
+o=$(CLINE_NO_AUTO_UPDATE=1 NO_COLOR=1 "$b" --version 2>&1 </dev/null); c=$?
 echo "code:$c"
 echo "ver:$(printf %s "$o" | head -n 3 | tr '\n' ' ')"`
 
@@ -116,14 +119,17 @@ var wslTest = func(d distro, flag, p string) bool {
 // wslHowInstalled says how the CLI at bin (real: where its links lead) was
 // installed in the distro, from where it is; nil when that says nothing
 // sure. cliupdate.go's howInstalled, on a Linux path asked of the distro.
-func wslHowInstalled(d distro, spec cliSpec, bin, real string) *updater {
+func wslHowInstalled(d distro, spec cliSpec, w wslCLI) *updater {
+	bin, real := w.bin, w.real
 	if spec.self != nil {
 		if c := spec.self(bin, real); c != nil {
 			pkg := ""
-			if len(spec.npm) > 0 {
+			if spec.line != nil {
+				pkg = spec.line(w.version())
+			} else if len(spec.npm) > 0 {
 				pkg = spec.npm[0]
 			}
-			u := &updater{via: "self", pkg: pkg, cmd: c, latest: spec.latest, wsl: d.Name}
+			u := &updater{via: "self", pkg: pkg, cmd: c, latest: spec.latest, selfNPM: spec.selfNPM, wsl: d.Name}
 			for _, p := range spec.npm {
 				if n := wslFromNodeModules(d, p, false, bin, real); n != nil && n.via == "npm" {
 					u.path = n.path
@@ -208,16 +214,23 @@ func wslBrewLatest(u *updater) (string, error) {
 // wslRunUpdate runs an update in the distro, as its user, with u's folder
 // first on PATH, and says what it printed.
 var wslRunUpdate = func(timeout time.Duration, u *updater) ([]byte, error) {
-	args := []string{"-d", u.wsl, "-e", "sh", "-c", `d="$1"; shift; PATH="$d:$HOME/.local/bin:$HOME/.bun/bin:$PATH"; export PATH; exec env NONINTERACTIVE=1 HOMEBREW_NO_ENV_HINTS=1 NO_COLOR=1 CLINE_NO_AUTO_UPDATE=1 "$@" 2>&1`, "sh", u.path}
+	args := []string{"-d", u.wsl, "-e", "sh", "-c", `d="$1"; shift; PATH="$d:$HOME/.local/bin:$HOME/.bun/bin:$PATH"; export PATH; exec env "$@" 2>&1`, "sh", u.path}
 	if u.path == "" {
 		args[len(args)-1] = "/usr/bin" // wsl.exe drops an empty argument
 	}
+	if u.packageUpdate() && u.registry != "" {
+		// Drop npm's lowercase alias and append the new uppercase value
+		// after any inherited aliases; npm folds these names to lowercase.
+		// Each assignment is an argument to env, never shell source.
+		args = append(args, "-u", "npm_config_registry", "-u", "NPM_CONFIG_REGISTRY")
+		args = append(args, npmregistry.Vars(u.registry)...)
+	}
+	args = append(args, "NONINTERACTIVE=1", "HOMEBREW_NO_ENV_HINTS=1", "NO_COLOR=1", "CLINE_NO_AUTO_UPDATE=1")
 	return wslRun(timeout, append(args, u.cmd...)...)
 }
 
-// wslCLI is the CLI of an agent in a running distro: what CliInfo says of
-// a host one.
-func (a *Agent) wslCLIInfo() (c CLI, ok bool) {
+// wslCLIInfo is the same CLI information as on the host, for an agent in a running distro.
+func (a *Agent) wslCLIInfo(registry string) (c CLI, ok bool) {
 	d, kind, ok := a.wslCLIOf()
 	if !ok {
 		return c, false
@@ -228,10 +241,11 @@ func (a *Agent) wslCLIInfo() (c CLI, ok bool) {
 		return c, false
 	}
 	c.Version, c.Path = w.version(), w.bin
-	u := wslHowInstalled(d, spec, w.bin, w.real)
+	u := wslHowInstalled(d, spec, w)
 	if u == nil {
 		return c, true
 	}
+	u.registry = registry
 	c.Via, c.Command = u.via, u.shown()
 	c.Latest = latestVersion(u)
 	c.Update = c.Version != "" && c.Latest != "" && Newer(c.Latest, c.Version)
@@ -249,7 +263,7 @@ func (a *Agent) updateWSL() (CLI, error) {
 	if !ok {
 		return CLI{}, fmt.Errorf("magpie can't find %s's CLI in %s", a.Name, a.WSL)
 	}
-	u := wslHowInstalled(d, spec, w.bin, w.real)
+	u := wslHowInstalled(d, spec, w)
 	if u == nil {
 		return CLI{}, fmt.Errorf("magpie can't tell how %s was installed at %s in %s — update it the way you installed it", a.Name, w.bin, a.WSL)
 	}
@@ -257,18 +271,18 @@ func (a *Agent) updateWSL() (CLI, error) {
 		return CLI{}, fmt.Errorf("%s is already being updated", a.Name)
 	}
 	defer updating.Delete(a.ID)
+	u.registry = npmregistry.Configured()
 	before := w.version()
-	if spec.target && u.via == "self" {
-		if v := latestVersion(u); Newer(v, before) {
-			u.cmd = append(u.cmd, v)
-		}
+	if err := u.noRegistryDowngrade(before); err != nil {
+		return CLI{}, err
 	}
+	u.pinTarget(spec, before)
 	out, err := wslRunUpdate(updateTimeout, u)
 	wslProbes.forget(d.Name + "\x00" + kind)
 	if u.via == "brew" {
 		latests.forget("brew:" + u.pkg)
 	}
-	c, _ := a.wslCLIInfo()
+	c, _ := a.wslCLIInfo(u.registry)
 	if err != nil {
 		msg := lastLines(string(out), 3)
 		if msg == "" {
